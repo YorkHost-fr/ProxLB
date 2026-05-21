@@ -1,0 +1,2 @@
+fixed:
+- Retry _get_rebalancing_job_status on ConnectionError [#104]

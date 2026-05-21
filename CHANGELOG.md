@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.1.1] - 2026-05-21
+
+### Fixed
+
+- Make max_node_inflow compatible with current solver [#106]
+- Retry _get_rebalancing_job_status on ConnectionError [#104]
+- Fix qmigrate job tracking [#105]
+- Depend on proxlb-solver 0.1.1 [#102]
+
+
 ## [2.1.0] - 2026-05-18
 
 ### Added
