@@ -1,3 +1,12 @@
+proxlb (2.1.1) stable; urgency=medium
+
+  * Make max_node_inflow compatible with current solver
+  * Retry _get_rebalancing_job_status on ConnectionError
+  * Fix qmigrate job tracking
+  * Depend on proxlb-solver 0.1.1
+
+ -- Damian Lukowski <damian.lukowski@credativ.de>  Thu, 21 May 2026 12:23:35 +0200
+
 proxlb (2.1.0) stable; urgency=medium
 
   * Fix streaming migration queue for parallel jobs. (Closes: #6)
