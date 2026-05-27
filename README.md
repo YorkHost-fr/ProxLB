@@ -8,29 +8,30 @@
 1. [Introduction](#introduction)
 2. [Features](#features)
 3. [How does it work?](#how-does-it-work)
-4. [Documentation](#documentation)
-5. [Installation](#installation)
+4. [ProxLB vs Proxmox Dynamic Load Balancing](#ProxLB-vs-Proxmox-Dynamic-Load-Balancing)
+5. [Documentation](#documentation)
+6. [Installation](#installation)
    1. [Requirements / Dependencies](#requirements--dependencies)
    2. [Debian Package](#debian-package)
    4. [Container / Docker](#container--docker)
    5. [Source](#source)
    6. [CP-SAT Solver (Optional)](#cp-sat-solver-optional)
-6. [Usage / Configuration](#usage--configuration)
+7. [Usage / Configuration](#usage--configuration)
    1. [Proxmox HA Integration](#proxmox-ha-integration)
    2. [Options](#options)
-7. [Affinity & Anti-Affinity Rules](#affinity--anti-affinity-rules)
+8. [Affinity & Anti-Affinity Rules](#affinity--anti-affinity-rules)
    1. [Affinity Rules](#affinity-rules)
    2. [Anti-Affinity Rules](#anti-affinity-rules)
    3. [Ignore VMs](#ignore-vms)
    4. [Pin VMs to Hypervisor Nodes](#pin-vms-to-hypervisor-nodes)
-8. [Maintenance](#maintenance)
-9. [Misc](#misc)
+9. [Maintenance](#maintenance)
+10. [Misc](#misc)
    1. [Bugs](#bugs)
    2. [Contributing](#contributing)
    3. [Support](#support)
-10. [Enterprise-Support](#enterprise-support)
-11. [Prox-Tools Collection](#prox-tools-collection)
-12. [Author(s)](#authors)
+11. [Enterprise-Support](#enterprise-support)
+12. [Prox-Tools Collection](#prox-tools-collection)
+13. [Author(s)](#authors)
 
 
 ## Introduction
@@ -79,6 +80,39 @@ ProxLB's key features are by enabling automatic rebalancing of VMs and CTs acros
 ProxLB is a load-balancing system designed to optimize the distribution of virtual machines (VMs) and containers (CTs) across a cluster. It works by first gathering resource usage metrics from all nodes in the cluster through the Proxmox API. This includes detailed resource metrics for each VM and CT on every node. ProxLB then evaluates the difference between the maximum and minimum resource usage of the nodes, referred to as "Balanciness." If this difference exceeds a predefined threshold (which is configurable), the system initiates the rebalancing process.
 
 Before starting any migrations, ProxLB validates that rebalancing actions are necessary and beneficial. Depending on the selected balancing mode — such as CPU, memory, or disk — it creates a balancing matrix. This matrix sorts the VMs by their maximum used or assigned resources, identifying the VM with the highest usage. ProxLB then places this VM on the node with the most free resources in the selected balancing type. This process runs recursively until the operator-defined Balanciness is achieved. Balancing can be defined for the used or max. assigned resources of VMs/CTs.
+
+## ProxLB vs Proxmox Dynamic Load Balancing
+With the introduction of Dynamic Load Balancing (DLB) in Proxmox VE 9.2, Proxmox now includes a native solution for automatically balancing HA workloads across cluster nodes. This naturally raises the question of how ProxLB compares to the built-in scheduler and whether an external balancing solution is still necessary.
+
+While both solutions aim to optimize resource utilization and automate VM placement, they follow different design philosophies. Proxmox DLB focuses on native integration, simplicity, and HA-aware balancing directly within the Proxmox cluster stack, whereas ProxLB provides a more flexible and customizable orchestration layer with advanced placement logic, affinity handling, and policy-based scheduling for any kind of workloads and is **not** limited to only HA workloads.
+
+The following comparison highlights the key differences, strengths, and use cases of both approaches.
+
+| Feature | ProxLB | PVE Native DLB |
+|---|---|---|
+| Integration level | External third-party scheduler | Built directly into Proxmox HA/CRS |
+| Works for guests with HA stack | Yes | Yes|
+| Works for guests without HA stack | Yes | No |
+| Real-time balancing | Yes | Yes |
+| VM migration automation | Yes | Yes |
+| Affinity / anti-affinity rules | Advanced | More basic / HA-rule focused |
+| Node pinning | Yes, incl. groups | Yes |
+| ProxPatch Support | Yes | No |
+| Custom scheduling logic | Extensive | Limited to Proxmox parameters |
+| Metrics considered | CPU, RAM, disk, overprovisioning, assignment logic | Primarily node + guest runtime utilization |
+| GUI integration | Partial / custom | Fully native |
+| Maintenance burden | You manage updates/config | Supported by Proxmox |
+| Stability / support | Community project | Officially supported |
+| Enterprise readiness | Powerful but external | Much better for standardized environments |
+| Complexity | Higher | Lower |
+| Best suited for | Advanced custom orchestration | Native enterprise balancing |
+| Dependency footprint | Additional daemon/service | Built-in functionality |
+| Upgrade handling | Manual compatibility validation | Included in Proxmox upgrades |
+| Scheduling aggressiveness | Highly customizable | Conservative by design |
+| Corosync related | No (good) | Yes (bad) |
+
+> [!TIP]
+> Still using PVE 8? The only solution is ProxLB! If you encounter issues due to more Corosync traffic, you might also want to switch to ProxLB (for large-scaled environemnts).
 
 ## Documentation
 This `README.md` doesn't contain all information and only highlights the most important facts. Extended information, such like API permissions, creating dedicated user, best-practices in running ProxLB and much more can be found in the [docs/](https://github.com/gyptazy/ProxLB/tree/main/docs) directory. Please consult the documentation before creating issues.
