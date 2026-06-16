@@ -199,6 +199,67 @@ class Balancing:
         return job_id
 
     @staticmethod
+    def _resolve_target_storage(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
+                                target_node: str, content: str) -> Optional[str]:
+        """
+        Resolves a storage on the target node for guests living on node-local
+        (non-shared) storage, whose source storage id may not exist on the target.
+
+        Resolution order:
+            1. an explicit mapping from the config (balancing.target_storage_map);
+            2. if balancing.target_storage_auto is enabled, the active and enabled
+               storage on the target node that accepts the given content type and
+               has the most free space;
+            3. otherwise None, keeping Proxmox' default behaviour (same storage id
+               as the source), which is correct for shared-storage clusters.
+
+        Args:
+            proxmox_api (ProxmoxApi): The Proxmox API client instance.
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            target_node (str): The node the guest is being migrated to.
+            content (str): The required storage content type ('images' for VMs,
+                'rootdir' for CTs).
+
+        Returns:
+            Optional[str]: The resolved target storage id, or None.
+        """
+        balancing = proxlb_data.meta.balancing
+
+        storage_map = balancing.target_storage_map or {}
+        if target_node in storage_map:
+            return storage_map[target_node]
+
+        if not balancing.target_storage_auto:
+            return None
+
+        try:
+            storages = proxmox_api.nodes(target_node).storage.get()
+        except proxmoxer.core.ResourceException as proxmox_api_error:
+            logger.debug(
+                f"Balancing: could not enumerate storages on node {target_node}: "
+                f"{proxmox_api_error}")
+            return None
+
+        candidates = [
+            storage for storage in storages
+            if int(storage.get("active", 0)) == 1
+            and int(storage.get("enabled", 1)) == 1
+            and content in (storage.get("content") or "")
+            and storage.get("avail") is not None
+        ]
+        if not candidates:
+            logger.debug(
+                f"Balancing: no active '{content}' storage found on node "
+                f"{target_node}; keeping source storage id.")
+            return None
+
+        target_storage = max(candidates, key=lambda storage: int(storage.get("avail", 0)))
+        logger.debug(
+            f"Balancing: selected target storage '{target_storage['storage']}' on node "
+            f"{target_node} ({int(target_storage.get('avail', 0)) // (1024 ** 3)} GiB free).")
+        return target_storage["storage"]
+
+    @staticmethod
     def _exec_rebalancing_vm(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData, guest_name: str) -> Optional[str]:
         """
         Executes the rebalancing of a virtual machine (VM) to a new node within the cluster.
@@ -230,6 +291,13 @@ class Balancing:
         # PVE versions, so we should not add it by default.
         if proxlb_data.meta.balancing.with_conntrack_state:
             migration_options['with-conntrack-state'] = 1
+
+        # On node-local storage clusters the source storage id may not exist on
+        # the target node. Remap to a suitable target storage when configured.
+        target_storage = Balancing._resolve_target_storage(
+            proxmox_api, proxlb_data, guest_node_target, "images")
+        if target_storage:
+            migration_options['targetstorage'] = target_storage
 
         try:
             logger.info(
@@ -266,12 +334,26 @@ class Balancing:
         guest_node_target = proxlb_data.guests[guest_name].node_target
         job_id = None
 
+        ct_migration_options = {
+            'target': guest_node_target,
+            'restart': 1,
+        }
+
+        # On node-local storage clusters the source storage id may not exist on
+        # the target node. Remap to a suitable target storage when configured.
+        # Note: LXC migration uses 'target-storage' (hyphenated) where QEMU uses
+        # 'targetstorage'.
+        target_storage = Balancing._resolve_target_storage(
+            proxmox_api, proxlb_data, guest_node_target, "rootdir")
+        if target_storage:
+            ct_migration_options['target-storage'] = target_storage
+
         try:
             logger.info(
                 f"Balancing: Starting to migrate CT guest {guest_name} "
                 f"from {guest_node_current} to {guest_node_target}.")
             job_id = proxmox_api.nodes(guest_node_current).lxc(guest_id).migrate().post(
-                target=guest_node_target, restart=1)
+                **ct_migration_options)
         except proxmoxer.core.ResourceException as proxmox_api_error:
             logger.critical(
                 f"Balancing: Failed to migrate guest {guest_name} of type CT due to some Proxmox errors. "
