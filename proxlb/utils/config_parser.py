@@ -17,7 +17,7 @@ except ImportError:
     PYYAML_PRESENT = False
 from enum import StrEnum
 from typing import Any, Optional, assert_never
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 from pathlib import Path
 from proxlb.utils.logger import SystemdLogger
 
@@ -81,6 +81,20 @@ class Config(BaseModel):
             Cpu = "cpu"
             Disk = "disk"
             Memory = "memory"
+            # The methods below are interpreted only by the optional CP-SAT
+            # solver (see the 'solver' section). 'global_smart' co-optimises
+            # memory, cpu and disk together; the '*_smart' methods blend a
+            # resource's usage with its PSI pressure; the '*_psi' methods use
+            # pressure alone. The built-in greedy balancer cannot evaluate them
+            # directly and maps them to a base resource via base_resource(), so
+            # these methods require solver.enable = True.
+            GlobalSmart = "global_smart"
+            CpuSmart = "cpu_smart"
+            MemorySmart = "memory_smart"
+            IoSmart = "io_smart"
+            CpuPsi = "cpu_psi"
+            MemoryPsi = "memory_psi"
+            IoPsi = "io_psi"
 
         class Mode(StrEnum):
             Assigned = "assigned"
@@ -132,7 +146,30 @@ class Config(BaseModel):
         target_storage_auto: bool = False
         target_storage_map: Optional[dict[str, str]] = None
 
+        @staticmethod
+        def base_resource(method: "Config.Balancing.Resource") -> "Config.Balancing.Resource":
+            """
+            Map any balancing method to the base resource (cpu/disk/memory) used
+            by the built-in greedy balancer.
+
+            Multi-resource ('global_smart') and pressure-aware ('*_smart',
+            '*_psi') methods are only meaningful to the CP-SAT solver. The greedy
+            balancer falls back to the underlying base resource so it never
+            receives a method it cannot evaluate.
+            """
+            resource = Config.Balancing.Resource
+            return {
+                resource.GlobalSmart: resource.Memory,
+                resource.MemorySmart: resource.Memory,
+                resource.MemoryPsi: resource.Memory,
+                resource.CpuSmart: resource.Cpu,
+                resource.CpuPsi: resource.Cpu,
+                resource.IoSmart: resource.Disk,
+                resource.IoPsi: resource.Disk,
+            }.get(method, method)
+
         def threshold(self, method: "Config.Balancing.Resource") -> Optional[int]:
+            method = Config.Balancing.base_resource(method)
             if method == self.Resource.Cpu:
                 return self.cpu_threshold
             elif method == self.Resource.Disk:
@@ -197,6 +234,23 @@ class Config(BaseModel):
     balancing: Balancing = Field(default_factory=Balancing)
     service: Service = Field(default_factory=Service)
     solver: Solver = Field(default_factory=Solver)
+
+    @model_validator(mode="after")
+    def _validate_method_requires_solver(self) -> "Config":
+        """
+        The multi-resource and pressure-aware balancing methods are evaluated
+        only by the CP-SAT solver. Reject them up-front when the solver is
+        disabled, instead of silently falling back to the base resource, so the
+        configuration does what the operator intended.
+        """
+        base = Config.Balancing.base_resource(self.balancing.method)
+        if base != self.balancing.method and not self.solver.enable:
+            raise ValueError(
+                f"balancing.method '{self.balancing.method}' is only supported by the "
+                f"CP-SAT solver. Set solver.enable to True to use it, or pick one of "
+                f"'cpu', 'disk', 'memory'."
+            )
+        return self
 
 
 class ConfigParser:

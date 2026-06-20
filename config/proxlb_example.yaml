@@ -46,7 +46,11 @@ balancing:
   memory_threshold: 75                # Optional: Maximum threshold (in percent) to trigger balancing actions
   cpu_threshold: 75                   # Optional: Maximum threshold (in percent) to trigger balancing actions
   balanciness: 5                      # Maximum delta of resource usage between highest and lowest usage node
-  method: memory                      # 'memory' | 'cpu' | 'disk'
+  method: memory                      # greedy: 'memory' | 'cpu' | 'disk'
+                                      # solver only (solver.enable: True):
+                                      #   'global_smart' (memory+cpu+disk combined),
+                                      #   'memory_smart'|'cpu_smart'|'io_smart' (usage+PSI),
+                                      #   'memory_psi'|'cpu_psi'|'io_psi' (pressure only)
   mode: used                          # 'assigned' | 'used' | 'psi'
   balance_larger_guests_first: False  # Option to prioritize balancing of larger or smaller guests first
   node_resource_reserve:              # Optional: Define resource reservations for nodes (in GB)

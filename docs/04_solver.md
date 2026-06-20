@@ -110,6 +110,23 @@ solver:
   active_step_retries: 3  # max re-solve attempts on migration failure (active mode only)
 ```
 
+### Balancing method
+
+The solver honours `balancing.method`. In addition to the greedy methods
+(`memory`, `cpu`, `disk`) it also accepts solver-only methods:
+
+- `global_smart` — co-optimises **memory, cpu and disk together**. This is the
+  recommended method when you want a single placement that balances all three
+  resources rather than one. Internal weights default to memory > cpu > disk.
+- `memory_smart` / `cpu_smart` / `io_smart` — blend a resource's usage with its
+  PSI pressure.
+- `memory_psi` / `cpu_psi` / `io_psi` — use PSI pressure alone.
+
+These methods require `solver.enable: True`; ProxLB rejects them at startup
+otherwise. The built-in greedy balancer (which still executes migrations in
+`shadow` mode and as the `active`-mode fallback) cannot evaluate them directly
+and transparently falls back to the underlying base resource.
+
 ### Configuration Reference
 
 | Key | Type | Default | Description |

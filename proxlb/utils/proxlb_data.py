@@ -83,6 +83,7 @@ class ProxLbData(BaseModel):
         type: GuestType
 
         def metric(self, name: BalancingResource) -> Metric:
+            name = Config.Balancing.base_resource(name)
             if name == BalancingResource.Cpu:
                 return self.cpu
             if name == BalancingResource.Disk:
@@ -114,6 +115,7 @@ class ProxLbData(BaseModel):
         memory: Metric
 
         def metric(self, name: BalancingResource) -> Metric:
+            name = Config.Balancing.base_resource(name)
             if name == BalancingResource.Cpu:
                 return self.cpu
             if name == BalancingResource.Disk:

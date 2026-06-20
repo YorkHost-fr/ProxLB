@@ -338,7 +338,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | balanciness |  | 10 | `Int` | The maximum delta of resource usage between node with highest and lowest usage. |
 |  | memory_threshold |  | 75 | `Int` | The maximum threshold (in percent) that needs to be hit to perform balancing actions. (Optional) |
 |  | cpu_threshold |  | 75 | `Int` | The maximum threshold (in percent) that needs to be hit to perform balancing actions. (Optional) |
-|  | method |  | memory | `Str` | The balancing method that should be used.  [values: `memory` (default), `cpu`, `disk`]|
+|  | method |  | memory | `Str` | The balancing method that should be used. The greedy balancer supports `memory` (default), `cpu`, `disk`. With the CP-SAT solver enabled (`solver.enable: True`), the multi-resource and pressure-aware methods are also available: `global_smart` (co-optimises memory+cpu+disk), `memory_smart` / `cpu_smart` / `io_smart` (usage blended with PSI pressure), and `memory_psi` / `cpu_psi` / `io_psi` (pressure only). Solver-only methods require the solver to be enabled.|
 |  | mode |  | used | `Str` | The balancing mode that should be used. [values: `used` (default), `assigned`, `psi` (pressure)] |
 |  | balance_larger_guests_first |  | False | `Bool` | Option to prefer larger/smaller guests first |
 |  | node_resource_reserve |  | { default: { memory: 4 }, { node01: { memory: 6 }} } | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
