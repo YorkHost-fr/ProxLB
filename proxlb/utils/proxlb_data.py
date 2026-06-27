@@ -20,6 +20,12 @@ class ProxLbData(BaseModel):
             balance_reason: str = 'resources'
             parallel_jobs: int = 5
             processed_guests_psi: list[str] = []
+            # Runtime-only: in-flight target-storage reservations for the current
+            # balancing pass, keyed by guest name -> ("<node>::<storage>", bytes).
+            # Populated when a migration is dispatched and released when it
+            # completes, so concurrent migrations targeting the same node-local
+            # storage do not collectively overcommit it. Not read from config.
+            storage_reservations: dict[str, tuple[str, int]] = {}
 
         balancing: Balancing = Balancing()  # pyright: ignore [reportIncompatibleVariableOverride]
         cluster_non_pve9: bool
