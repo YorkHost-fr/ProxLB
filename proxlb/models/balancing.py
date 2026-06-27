@@ -31,6 +31,15 @@ GuestType = Config.GuestType
 logger = SystemdLogger()
 
 
+class InsufficientTargetStorageError(Exception):
+    """
+    Raised when the capacity guard finds no storage on the target node able to
+    hold a guest's disk plus the configured safety margin. The migration of that
+    guest is skipped for the current pass rather than being forced onto a storage
+    that would overcommit and risk a disk-full / IO-error condition.
+    """
+
+
 class Balancing:
     """
     The balancing class is responsible for processing workloads on Proxmox clusters.
@@ -106,6 +115,9 @@ class Balancing:
         parallel_job_limit = Balancing.get_parallel_job_limit(proxlb_data.meta.balancing)
         logger.debug(f"Balancing: parallel_job_limit resolved to {parallel_job_limit}.")
 
+        # Reset in-flight storage reservations for this pass.
+        proxlb_data.meta.balancing.storage_reservations = {}
+
         jobs_to_wait: list[Balancing.RebalancingJob] = []
         max_retries = proxlb_data.meta.balancing.max_job_validation
         error_occurred = False
@@ -113,7 +125,7 @@ class Balancing:
         logger.debug("Starting: Balancing loop for guests.")
         for guest_name, guest_meta in proxlb_data.guests.items():
             while len(jobs_to_wait) >= parallel_job_limit:
-                if Balancing._check_jobs_and_update(proxmox_api, jobs_to_wait, max_retries):
+                if Balancing._check_jobs_and_release(proxmox_api, proxlb_data, jobs_to_wait, max_retries):
                     error_occurred = True
                 if len(jobs_to_wait) >= parallel_job_limit:
                     time.sleep(5)
@@ -129,7 +141,7 @@ class Balancing:
                 ))
 
         while jobs_to_wait:
-            if Balancing._check_jobs_and_update(proxmox_api, jobs_to_wait, max_retries):
+            if Balancing._check_jobs_and_release(proxmox_api, proxlb_data, jobs_to_wait, max_retries):
                 error_occurred = True
             if jobs_to_wait:
                 time.sleep(5)
@@ -199,8 +211,90 @@ class Balancing:
         return job_id
 
     @staticmethod
+    def _reserved_bytes(proxlb_data: ProxLbData, target_node: str, storage_id: str) -> int:
+        """
+        Sum the bytes reserved on a given (node, storage) by other migrations that
+        are still in flight during the current balancing pass. Used by the
+        capacity guard so that several concurrent migrations targeting the same
+        node-local storage do not collectively overcommit it.
+
+        Args:
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            target_node (str): The destination node.
+            storage_id (str): The destination storage id.
+
+        Returns:
+            int: The number of bytes already reserved on that storage.
+        """
+        key = f"{target_node}::{storage_id}"
+        reservations = proxlb_data.meta.balancing.storage_reservations
+        return sum(size for (res_key, size) in reservations.values() if res_key == key)
+
+    @staticmethod
+    def _reserve_target_storage(proxlb_data: ProxLbData, guest_name: str,
+                                target_node: str, storage_id: str, size_bytes: int) -> None:
+        """
+        Record an in-flight reservation of `size_bytes` on (target_node,
+        storage_id) for `guest_name`, so concurrent migrations in the same pass
+        account for space that is being consumed but not yet reflected in the
+        storage's reported free space.
+
+        Args:
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            guest_name (str): The migrating guest (reservation key).
+            target_node (str): The destination node.
+            storage_id (str): The destination storage id.
+            size_bytes (int): The provisioned disk size being moved.
+        """
+        proxlb_data.meta.balancing.storage_reservations[guest_name] = (
+            f"{target_node}::{storage_id}", size_bytes)
+
+    @staticmethod
+    def _release_target_storage(proxlb_data: ProxLbData, guest_name: str) -> None:
+        """
+        Release the in-flight storage reservation held for `guest_name` once its
+        migration has finished (successfully or not) and the destination storage's
+        reported free space reflects the change.
+
+        Args:
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            guest_name (str): The guest whose reservation to release.
+        """
+        proxlb_data.meta.balancing.storage_reservations.pop(guest_name, None)
+
+    @staticmethod
+    def _storage_fits(storage: dict, required_bytes: int, reserved_bytes: int,
+                      balancing: "ProxLbData.Meta.Balancing") -> bool:
+        """
+        Decide whether a storage can hold an additional `required_bytes` while
+        keeping the configured safety margin free, after subtracting space
+        already reserved by in-flight migrations.
+
+        The margin is max(min_free_percent of the storage total capacity,
+        min_free_gib). When the storage does not report a total capacity, the
+        currently available space is used as the basis for the percentage.
+
+        Args:
+            storage (dict): A storage entry from the Proxmox storage status API.
+            required_bytes (int): Provisioned disk size of the guest to migrate.
+            reserved_bytes (int): Bytes already reserved on this storage in-flight.
+            balancing (ProxLbData.Meta.Balancing): Balancing configuration.
+
+        Returns:
+            bool: True if the storage can safely accept the guest.
+        """
+        avail = int(storage.get("avail") or 0)
+        total = int(storage.get("total") or 0) or avail
+        percent = float(getattr(balancing, "target_storage_min_free_percent", 10.0) or 0)
+        floor_gib = int(getattr(balancing, "target_storage_min_free_gib", 0) or 0)
+        margin = max(int(total * percent / 100), floor_gib * (1024 ** 3))
+        effective_free = avail - reserved_bytes
+        return (effective_free - required_bytes) >= margin
+
+    @staticmethod
     def _resolve_target_storage(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
-                                target_node: str, content: str) -> Optional[str]:
+                                target_node: str, content: str,
+                                required_bytes: int = 0) -> Optional[str]:
         """
         Resolves a storage on the target node for guests living on node-local
         (non-shared) storage, whose source storage id may not exist on the target.
@@ -209,9 +303,15 @@ class Balancing:
             1. an explicit mapping from the config (balancing.target_storage_map);
             2. if balancing.target_storage_auto is enabled, the active and enabled
                storage on the target node that accepts the given content type and
-               has the most free space;
+               has enough free space (capacity guard) with the most headroom;
             3. otherwise None, keeping Proxmox' default behaviour (same storage id
                as the source), which is correct for shared-storage clusters.
+
+        When `required_bytes` is provided and the capacity guard is enabled, every
+        candidate (including an explicitly mapped one) must keep its safety margin
+        free after accounting for the guest's disk and other in-flight migrations.
+        If none qualifies, InsufficientTargetStorageError is raised so the caller
+        skips the guest instead of overcommitting the storage.
 
         Args:
             proxmox_api (ProxmoxApi): The Proxmox API client instance.
@@ -219,15 +319,42 @@ class Balancing:
             target_node (str): The node the guest is being migrated to.
             content (str): The required storage content type ('images' for VMs,
                 'rootdir' for CTs).
+            required_bytes (int): Provisioned disk size of the guest. When 0 the
+                capacity guard is skipped (size unknown).
 
         Returns:
             Optional[str]: The resolved target storage id, or None.
+
+        Raises:
+            InsufficientTargetStorageError: When the guard is active and no
+                candidate storage can safely hold the guest.
         """
         balancing = proxlb_data.meta.balancing
+        guard = required_bytes > 0 and bool(
+            getattr(balancing, "target_storage_capacity_guard", True))
 
         storage_map = balancing.target_storage_map or {}
         if target_node in storage_map:
-            return storage_map[target_node]
+            mapped = storage_map[target_node]
+            if guard:
+                try:
+                    storages = proxmox_api.nodes(target_node).storage.get()
+                except proxmoxer.core.ResourceException as proxmox_api_error:
+                    logger.debug(
+                        f"Balancing: could not verify mapped storage '{mapped}' on node "
+                        f"{target_node}: {proxmox_api_error}; trusting the explicit mapping.")
+                    return mapped
+                entry = next(
+                    (s for s in storages if s.get("storage") == mapped), None)
+                if entry is not None:
+                    reserved = Balancing._reserved_bytes(proxlb_data, target_node, mapped)
+                    if not Balancing._storage_fits(entry, required_bytes, reserved, balancing):
+                        raise InsufficientTargetStorageError(
+                            f"mapped storage '{mapped}' on node {target_node} cannot hold "
+                            f"{required_bytes // (1024 ** 3)} GiB plus margin "
+                            f"(avail {int(entry.get('avail') or 0) // (1024 ** 3)} GiB, "
+                            f"reserved {reserved // (1024 ** 3)} GiB).")
+            return mapped
 
         if not balancing.target_storage_auto:
             return None
@@ -253,7 +380,27 @@ class Balancing:
                 f"{target_node}; keeping source storage id.")
             return None
 
-        target_storage = max(candidates, key=lambda storage: int(storage.get("avail", 0)))
+        if guard:
+            fitting = [
+                storage for storage in candidates
+                if Balancing._storage_fits(
+                    storage, required_bytes,
+                    Balancing._reserved_bytes(proxlb_data, target_node, storage["storage"]),
+                    balancing)
+            ]
+            if not fitting:
+                raise InsufficientTargetStorageError(
+                    f"no '{content}' storage on node {target_node} can hold "
+                    f"{required_bytes // (1024 ** 3)} GiB plus the configured margin "
+                    f"(checked {len(candidates)} candidate(s)).")
+            # Most headroom first, accounting for in-flight reservations.
+            target_storage = max(
+                fitting,
+                key=lambda storage: int(storage.get("avail", 0)) - Balancing._reserved_bytes(
+                    proxlb_data, target_node, storage["storage"]))
+        else:
+            target_storage = max(candidates, key=lambda storage: int(storage.get("avail", 0)))
+
         logger.debug(
             f"Balancing: selected target storage '{target_storage['storage']}' on node "
             f"{target_node} ({int(target_storage.get('avail', 0)) // (1024 ** 3)} GiB free).")
@@ -294,8 +441,18 @@ class Balancing:
 
         # On node-local storage clusters the source storage id may not exist on
         # the target node. Remap to a suitable target storage when configured.
-        target_storage = Balancing._resolve_target_storage(
-            proxmox_api, proxlb_data, guest_node_target, "images")
+        # The capacity guard skips this guest if no target storage can safely
+        # hold its disk, preventing disk-full / IO errors from overcommit.
+        required_bytes = int(proxlb_data.guests[guest_name].disk.total or 0)
+        try:
+            target_storage = Balancing._resolve_target_storage(
+                proxmox_api, proxlb_data, guest_node_target, "images", required_bytes)
+        except InsufficientTargetStorageError as storage_error:
+            logger.warning(
+                f"Balancing: Skipping migration of VM guest {guest_name} to "
+                f"{guest_node_target}: {storage_error}")
+            logger.debug("Finished: _exec_rebalancing_vm.")
+            return None
         if target_storage:
             migration_options['targetstorage'] = target_storage
 
@@ -304,6 +461,9 @@ class Balancing:
                 f"Balancing: Starting to migrate VM guest {guest_name} "
                 f"from {guest_node_current} to {guest_node_target}.")
             job_id = proxmox_api.nodes(guest_node_current).qemu(guest_id).migrate().post(**migration_options)
+            if job_id is not None and target_storage and required_bytes > 0:
+                Balancing._reserve_target_storage(
+                    proxlb_data, guest_name, guest_node_target, target_storage, required_bytes)
         except proxmoxer.core.ResourceException as proxmox_api_error:
             logger.critical(
                 f"Balancing: Failed to migrate guest {guest_name} of type VM due to some Proxmox errors. "
@@ -342,9 +502,18 @@ class Balancing:
         # On node-local storage clusters the source storage id may not exist on
         # the target node. Remap to a suitable target storage when configured.
         # Note: LXC migration uses 'target-storage' (hyphenated) where QEMU uses
-        # 'targetstorage'.
-        target_storage = Balancing._resolve_target_storage(
-            proxmox_api, proxlb_data, guest_node_target, "rootdir")
+        # 'targetstorage'. The capacity guard skips this guest if no target
+        # storage can safely hold its disk.
+        required_bytes = int(proxlb_data.guests[guest_name].disk.total or 0)
+        try:
+            target_storage = Balancing._resolve_target_storage(
+                proxmox_api, proxlb_data, guest_node_target, "rootdir", required_bytes)
+        except InsufficientTargetStorageError as storage_error:
+            logger.warning(
+                f"Balancing: Skipping migration of CT guest {guest_name} to "
+                f"{guest_node_target}: {storage_error}")
+            logger.debug("Finished: _exec_rebalancing_ct.")
+            return None
         if target_storage:
             ct_migration_options['target-storage'] = target_storage
 
@@ -354,6 +523,9 @@ class Balancing:
                 f"from {guest_node_current} to {guest_node_target}.")
             job_id = proxmox_api.nodes(guest_node_current).lxc(guest_id).migrate().post(
                 **ct_migration_options)
+            if job_id is not None and target_storage and required_bytes > 0:
+                Balancing._reserve_target_storage(
+                    proxlb_data, guest_name, guest_node_target, target_storage, required_bytes)
         except proxmoxer.core.ResourceException as proxmox_api_error:
             logger.critical(
                 f"Balancing: Failed to migrate guest {guest_name} of type CT due to some Proxmox errors. "
@@ -364,6 +536,31 @@ class Balancing:
 
         logger.debug("Finished: _exec_rebalancing_ct.")
         return job_id
+
+    @staticmethod
+    def _check_jobs_and_release(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
+                                jobs_to_wait: list['Balancing.RebalancingJob'],
+                                max_retries: int) -> bool:
+        """
+        Wraps _check_jobs_and_update and releases the in-flight storage
+        reservation of every job that left the queue (finished, failed or timed
+        out) during the check, so freed space becomes available to subsequent
+        migrations in the same pass.
+
+        Args:
+            proxmox_api (ProxmoxApi): The Proxmox API client instance.
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            jobs_to_wait (list): The list of currently in-flight jobs (mutated in place).
+            max_retries (int): Maximum number of status checks before timeout.
+
+        Returns:
+            bool: True if any job entered an error state, False otherwise.
+        """
+        before = {job.name for job in jobs_to_wait}
+        error_occurred = Balancing._check_jobs_and_update(proxmox_api, jobs_to_wait, max_retries)
+        for completed_name in before - {job.name for job in jobs_to_wait}:
+            Balancing._release_target_storage(proxlb_data, completed_name)
+        return error_occurred
 
     @staticmethod
     def _check_jobs_and_update(proxmox_api: ProxmoxApi, jobs_to_wait: list['Balancing.RebalancingJob'], max_retries: int) -> bool:
