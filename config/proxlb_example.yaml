@@ -39,6 +39,11 @@ balancing:
   # target_storage_map:               # Optional: pin a storage per target node (overrides auto)
   #   pve5: local
   #   pve2: local
+  target_storage_capacity_guard: True # Skip a migration when the target storage cannot hold the
+                                      # guest's disk plus the margin below (accounts for in-flight
+                                      # migrations). Prevents disk-full / IO errors from overcommit.
+  target_storage_min_free_percent: 10.0  # Safety margin to keep free, as % of the storage's total size
+  target_storage_min_free_gib: 0      # Absolute safety margin floor in GiB (effective margin = max of both)
   cpu_overcommit: 2.0                 # Maximum ratio of vCPUs to physical cores per node
   max_node_inflow: 1                  # Maximum number of VMs that may be migrated onto any single node per run
   balance_types: ['vm', 'ct']         # 'vm' | 'ct'

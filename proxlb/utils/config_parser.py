@@ -145,6 +145,23 @@ class Config(BaseModel):
         # per target node and takes precedence over auto selection.
         target_storage_auto: bool = False
         target_storage_map: Optional[dict[str, str]] = None
+        # Capacity guard for the target storage remapping above. When enabled
+        # (default), a guest is only migrated onto a target storage that can hold
+        # its provisioned disk size plus a safety margin, after subtracting the
+        # space already reserved by other in-flight migrations of the same pass.
+        # This prevents the disk-full / IO-error condition that occurs when
+        # several migrations target the same node-local storage concurrently
+        # (each one sees the pre-migration free space) or when a single image is
+        # larger than the remaining free space. If no target storage on the
+        # destination node passes the check, the guest is skipped for this pass
+        # rather than forced onto the least-bad storage. The effective margin is
+        # max('target_storage_min_free_percent' of the storage's total capacity,
+        # 'target_storage_min_free_gib'). Note: for thin-provisioned pools
+        # (lvmthin/zfs) the reported free space is the pool's, so the percentage
+        # margin is the main protection against overcommit-induced fill-ups.
+        target_storage_capacity_guard: bool = True
+        target_storage_min_free_percent: float = 10.0
+        target_storage_min_free_gib: int = 0
 
         @staticmethod
         def base_resource(method: "Config.Balancing.Resource") -> "Config.Balancing.Resource":
