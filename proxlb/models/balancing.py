@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TaskStatus = ProxmoxAPI.Nodes.Node.Tasks.Upid.Status._Get.TypedDict
     StorageEntry = ProxmoxAPI.Nodes.Node.Storage._Get.TypedDict
     Storages = list[StorageEntry]
+    HaResources = list[ProxmoxAPI.Cluster.Ha.Resources._Get.TypedDict]
 
 GuestType = Config.GuestType
 
@@ -117,8 +118,10 @@ class Balancing:
         parallel_job_limit = Balancing.get_parallel_job_limit(proxlb_data.meta.balancing)
         logger.debug(f"Balancing: parallel_job_limit resolved to {parallel_job_limit}.")
 
-        # Reset in-flight storage reservations for this pass.
+        # Reset in-flight storage reservations and the HA-managed resource
+        # cache for this pass.
         proxlb_data.meta.balancing.storage_reservations = {}
+        proxlb_data.meta.balancing.ha_managed_sids = None
 
         jobs_to_wait: list[Balancing.RebalancingJob] = []
         max_retries = proxlb_data.meta.balancing.max_job_validation
@@ -263,6 +266,42 @@ class Balancing:
             guest_name (str): The guest whose reservation to release.
         """
         proxlb_data.meta.balancing.storage_reservations.pop(guest_name, None)
+
+    @staticmethod
+    def _is_ha_managed(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
+                       sid_prefix: str, guest_id: int) -> bool:
+        """
+        Checks whether a guest is managed by the Proxmox HA manager. The HA
+        resource list is fetched once per balancing pass and cached, since the
+        answer is needed for every guest whose target storage would be remapped.
+
+        This matters for the target storage remap: migrations of HA-managed
+        guests are routed through the HA stack (hamigrate), which does not
+        forward the 'targetstorage' / 'target-storage' parameter to the
+        underlying qmigrate/vzmigrate task. On node-local storage clusters that
+        task then fails with "storage 'X' is not available on node 'Y'", so
+        such guests must be skipped instead of migrated with a remap.
+
+        Args:
+            proxmox_api (ProxmoxApi): The Proxmox API client instance.
+            proxlb_data (ProxLbData): ProxLB load balancing data.
+            sid_prefix (str): The HA service id prefix ('vm' or 'ct').
+            guest_id (int): The guest's vmid.
+
+        Returns:
+            bool: True if the guest is an HA-managed resource.
+        """
+        balancing = proxlb_data.meta.balancing
+        if balancing.ha_managed_sids is None:
+            try:
+                ha_resources: 'HaResources' = proxmox_api.cluster.ha.resources.get()
+                balancing.ha_managed_sids = [resource["sid"] for resource in ha_resources]
+            except proxmoxer.core.ResourceException as proxmox_api_error:
+                logger.debug(
+                    f"Balancing: could not list HA resources: {proxmox_api_error}. "
+                    "Assuming no guest is HA-managed.")
+                balancing.ha_managed_sids = []
+        return f"{sid_prefix}:{guest_id}" in balancing.ha_managed_sids
 
     @staticmethod
     def _storage_fits(storage: 'StorageEntry', required_bytes: int, reserved_bytes: int,
@@ -456,6 +495,17 @@ class Balancing:
             logger.debug("Finished: _exec_rebalancing_vm.")
             return None
         if target_storage:
+            # The HA stack does not forward 'targetstorage' to the qmigrate task
+            # it spawns, which would then fail with "storage 'X' is not available
+            # on node 'Y'". Skip HA-managed guests instead of remapping them.
+            if Balancing._is_ha_managed(proxmox_api, proxlb_data, "vm", guest_id):
+                logger.warning(
+                    f"Balancing: Skipping migration of VM guest {guest_name} to "
+                    f"{guest_node_target}: the guest is HA-managed and Proxmox does not "
+                    f"apply a target storage remap (targetstorage '{target_storage}') to "
+                    "HA migrations. Remove the guest from HA or migrate it manually.")
+                logger.debug("Finished: _exec_rebalancing_vm.")
+                return None
             migration_options['targetstorage'] = target_storage
 
         try:
@@ -517,6 +567,17 @@ class Balancing:
             logger.debug("Finished: _exec_rebalancing_ct.")
             return None
         if target_storage:
+            # The HA stack does not forward 'target-storage' to the migration task
+            # it spawns, which would then fail with "storage 'X' is not available
+            # on node 'Y'". Skip HA-managed guests instead of remapping them.
+            if Balancing._is_ha_managed(proxmox_api, proxlb_data, "ct", guest_id):
+                logger.warning(
+                    f"Balancing: Skipping migration of CT guest {guest_name} to "
+                    f"{guest_node_target}: the guest is HA-managed and Proxmox does not "
+                    f"apply a target storage remap (target-storage '{target_storage}') to "
+                    "HA migrations. Remove the guest from HA or migrate it manually.")
+                logger.debug("Finished: _exec_rebalancing_ct.")
+                return None
             ct_migration_options['target-storage'] = target_storage
 
         try:

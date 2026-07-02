@@ -26,6 +26,11 @@ class ProxLbData(BaseModel):
             # completes, so concurrent migrations targeting the same node-local
             # storage do not collectively overcommit it. Not read from config.
             storage_reservations: dict[str, tuple[str, int]] = {}
+            # Runtime-only: HA-managed resource sids (e.g. 'vm:100', 'ct:101'),
+            # fetched lazily once per balancing pass. None means "not fetched
+            # yet". Used to skip target storage remaps for HA-managed guests,
+            # since the HA stack does not forward the target storage parameter.
+            ha_managed_sids: Optional[list[str]] = None
 
         balancing: Balancing = Balancing()  # pyright: ignore [reportIncompatibleVariableOverride]
         cluster_non_pve9: bool
