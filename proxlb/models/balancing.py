@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from proxmoxer_types.v9.core import ProxmoxAPI
     TaskListEntry = ProxmoxAPI.Nodes.Node.Tasks._Get.TypedDict
     TaskStatus = ProxmoxAPI.Nodes.Node.Tasks.Upid.Status._Get.TypedDict
+    StorageEntry = ProxmoxAPI.Nodes.Node.Storage._Get.TypedDict
+    Storages = list[StorageEntry]
 
 GuestType = Config.GuestType
 
@@ -263,7 +265,7 @@ class Balancing:
         proxlb_data.meta.balancing.storage_reservations.pop(guest_name, None)
 
     @staticmethod
-    def _storage_fits(storage: dict, required_bytes: int, reserved_bytes: int,
+    def _storage_fits(storage: 'StorageEntry', required_bytes: int, reserved_bytes: int,
                       balancing: "ProxLbData.Meta.Balancing") -> bool:
         """
         Decide whether a storage can hold an additional `required_bytes` while
@@ -275,7 +277,7 @@ class Balancing:
         currently available space is used as the basis for the percentage.
 
         Args:
-            storage (dict): A storage entry from the Proxmox storage status API.
+            storage (StorageEntry): A storage entry from the Proxmox storage status API.
             required_bytes (int): Provisioned disk size of the guest to migrate.
             reserved_bytes (int): Bytes already reserved on this storage in-flight.
             balancing (ProxLbData.Meta.Balancing): Balancing configuration.
@@ -283,10 +285,10 @@ class Balancing:
         Returns:
             bool: True if the storage can safely accept the guest.
         """
-        avail = int(storage.get("avail") or 0)
-        total = int(storage.get("total") or 0) or avail
-        percent = float(getattr(balancing, "target_storage_min_free_percent", 10.0) or 0)
-        floor_gib = int(getattr(balancing, "target_storage_min_free_gib", 0) or 0)
+        avail = storage.get("avail") or 0
+        total = storage.get("total") or avail
+        percent = balancing.target_storage_min_free_percent
+        floor_gib = balancing.target_storage_min_free_gib
         margin = max(int(total * percent / 100), floor_gib * (1024 ** 3))
         effective_free = avail - reserved_bytes
         return (effective_free - required_bytes) >= margin
@@ -338,7 +340,7 @@ class Balancing:
             mapped = storage_map[target_node]
             if guard:
                 try:
-                    storages = proxmox_api.nodes(target_node).storage.get()
+                    storages: 'Storages' = proxmox_api.nodes(target_node).storage.get()
                 except proxmoxer.core.ResourceException as proxmox_api_error:
                     logger.debug(
                         f"Balancing: could not verify mapped storage '{mapped}' on node "
@@ -352,7 +354,7 @@ class Balancing:
                         raise InsufficientTargetStorageError(
                             f"mapped storage '{mapped}' on node {target_node} cannot hold "
                             f"{required_bytes // (1024 ** 3)} GiB plus margin "
-                            f"(avail {int(entry.get('avail') or 0) // (1024 ** 3)} GiB, "
+                            f"(avail {(entry.get('avail') or 0) // (1024 ** 3)} GiB, "
                             f"reserved {reserved // (1024 ** 3)} GiB).")
             return mapped
 
@@ -360,7 +362,7 @@ class Balancing:
             return None
 
         try:
-            storages = proxmox_api.nodes(target_node).storage.get()
+            node_storages: 'Storages' = proxmox_api.nodes(target_node).storage.get()
         except proxmoxer.core.ResourceException as proxmox_api_error:
             logger.debug(
                 f"Balancing: could not enumerate storages on node {target_node}: "
@@ -368,10 +370,10 @@ class Balancing:
             return None
 
         candidates = [
-            storage for storage in storages
-            if int(storage.get("active", 0)) == 1
-            and int(storage.get("enabled", 1)) == 1
-            and content in (storage.get("content") or "")
+            storage for storage in node_storages
+            if storage.get("active", 0) == 1
+            and storage.get("enabled", 1) == 1
+            and content in storage.get("content", "").split(",")
             and storage.get("avail") is not None
         ]
         if not candidates:
@@ -396,14 +398,14 @@ class Balancing:
             # Most headroom first, accounting for in-flight reservations.
             target_storage = max(
                 fitting,
-                key=lambda storage: int(storage.get("avail", 0)) - Balancing._reserved_bytes(
+                key=lambda storage: (storage.get("avail") or 0) - Balancing._reserved_bytes(
                     proxlb_data, target_node, storage["storage"]))
         else:
-            target_storage = max(candidates, key=lambda storage: int(storage.get("avail", 0)))
+            target_storage = max(candidates, key=lambda storage: storage.get("avail") or 0)
 
         logger.debug(
             f"Balancing: selected target storage '{target_storage['storage']}' on node "
-            f"{target_node} ({int(target_storage.get('avail', 0)) // (1024 ** 3)} GiB free).")
+            f"{target_node} ({(target_storage.get('avail') or 0) // (1024 ** 3)} GiB free).")
         return target_storage["storage"]
 
     @staticmethod
