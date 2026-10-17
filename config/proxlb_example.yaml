@@ -58,6 +58,7 @@ balancing:
                                       #   'memory_psi'|'cpu_psi'|'io_psi' (pressure only)
   mode: used                          # 'assigned' | 'used' | 'psi'
   balance_larger_guests_first: False  # Option to prioritize balancing of larger or smaller guests first
+  # ignore_guests: ['my-auto-vm-01', 'my-auto-vm-02']  # Optional: Ignore guests by name instead of using plb_ignore_* tags
   node_resource_reserve:              # Optional: Define resource reservations for nodes (in GB)
     defaults:                         # Default reservation values applying to all nodes (unless explicitly overridden)
       memory: 4                       # Default: 4 GB memory reserved per node
@@ -123,3 +124,4 @@ service:
 #   timeout_seconds: 30             # CP-SAT wall-clock time limit per solve (seconds)
 #   use_reservations: True          # Apply node_resource_reserve entries as hard constraints
 #   active_step_retries: 3          # Max re-solve attempts on migration failure (active mode only)
+#   fallback_to_greedy: True        # Fall back to greedy Balancing() when the solver cannot place VMs (active mode only)
