@@ -284,6 +284,7 @@ solver:
   timeout_seconds: 30
   use_reservations: True
   active_step_retries: 3
+  fallback_to_greedy: True
 ```
 
 See [docs/04_solver.md](docs/04_solver.md) for the full configuration reference, a description of the feedback loop in active mode, and instructions for generating HTML reports.
@@ -345,6 +346,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | method |  | memory | `Str` | The balancing method that should be used. The greedy balancer supports `memory` (default), `cpu`, `disk`. With the CP-SAT solver enabled (`solver.enable: True`), the multi-resource and pressure-aware methods are also available: `global_smart` (co-optimises memory+cpu+disk), `memory_smart` / `cpu_smart` / `io_smart` (usage blended with PSI pressure), and `memory_psi` / `cpu_psi` / `io_psi` (pressure only). Solver-only methods require the solver to be enabled.|
 |  | mode |  | used | `Str` | The balancing mode that should be used. [values: `used` (default), `assigned`, `psi` (pressure)] |
 |  | balance_larger_guests_first |  | False | `Bool` | Option to prefer larger/smaller guests first |
+|  | ignore_zfs_arc |  | False | `Bool` | Do not count the ZFS ARC as used memory of a node. Requires PVE >= 9. |
 |  | node_resource_reserve |  | { default: { memory: 4 }, { node01: { memory: 6 }} } | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
@@ -428,6 +430,7 @@ balancing:
   method: memory
   mode: used
   balance_larger_guests_first: False
+  ignore_zfs_arc: False
   node_resource_reserve:
     defaults:
       memory: 4
@@ -557,16 +560,28 @@ balancing:
 ### Ignore VMs
 <img align="left" src="https://cdn.gyptazy.com/img/proxlb-ignore-vm-movement.jpg"/> Guests, such as VMs or CTs, can also be completely ignored. This means, they won't be affected by any migration (even when (anti-)affinity rules are enforced). To ensure a proper resource evaluation, these guests are still collected and evaluated but simply skipped for balancing actions. Another thing is the implementation. While ProxLB might have a very restricted configuration file including the file permissions, this file is only read- and writeable by the Proxmox administrators. However, we might have user and groups who want to define on their own that their systems shouldn't be moved. Therefore, these users can simpy set a specific tag to the guest object - just like the (anti)affinity rules.
 
+**Note:** Ignored guests are really ignored. Even by enforcing affinity rules this guest will be ignored.
+
+#### Ignoring VMs via Tags
 To define a guest to be ignored from the balancing, users assign a tag with the prefix `plb_ignore_$TAG`:
 
-#### Example for Screenshot
+##### Example for Screenshot
 ```
 plb_ignore_dev
 ```
 
 As a result, ProxLB will not migrate this guest with the `plb_ignore_dev` tag to any other node.
 
-**Note:** Ignored guests are really ignored. Even by enforcing affinity rules this guest will be ignored.
+#### Ignoring VMs by Name via Configuration
+Guests can also be ignored by name directly in the ProxLB configuration file. This is useful for automatically provisioned VMs or CTs that cannot have tags assigned themselves.
+
+**Example Config**
+```yaml
+balancing:
+  ignore_guests: ['my-auto-vm-01', 'my-auto-vm-02']
+```
+
+As a result, ProxLB will not migrate any guest whose name appears in the `ignore_guests` list.
 
 ### Pin VMs to Specific Hypervisor Nodes
 <img align="left" src="https://cdn.gyptazy.com/img/proxlb-tag-node-pinning.jpg"/> Guests, such as VMs or CTs, can also be pinned to specific (and multiple) nodes in the cluster. This might be usefull when running applications with some special licensing requirements that are only fulfilled on certain nodes. It might also be interesting, when some physical hardware is attached to a node, that is not available in general within the cluster.

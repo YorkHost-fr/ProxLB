@@ -125,6 +125,8 @@ class Config(BaseModel):
         enable: bool = False
         enforce_affinity: bool = False
         enforce_pinning: bool = False
+        ignore_guests: list[str] = []
+        ignore_zfs_arc: bool = False
         live: bool = True
         max_job_validation: int = 1800
         max_node_inflow: Optional[int] = 1
@@ -314,13 +316,28 @@ class Config(BaseModel):
         max_resume_attempts: int = Field(default=3, ge=1)
 
     class Solver(BaseModel):
+        class Method(StrEnum):
+            Cpu = "cpu"
+            CpuPsi = "cpu_psi"
+            CpuSmart = "cpu_smart"
+            Disk = "disk"
+            GlobalSmart = "global_smart"
+            IoPsi = "io_psi"
+            IoSmart = "io_smart"
+            Memory = "memory"
+            MemoryPsi = "memory_psi"
+            MemorySmart = "memory_smart"
+
         class Mode(StrEnum):
             Active = "active"
             Shadow = "shadow"
 
         active_step_retries: int = 3
         enable: bool = False
+        fallback_to_greedy: bool = True
         log_dir: str = "/var/log/proxlb/solver"
+        # Overrides balancing.method for the solver only; None uses balancing.method.
+        method: Optional[Method] = None
         mode: Mode = Mode.Shadow
         timeout_seconds: float = 30.0
         use_reservations: bool = True

@@ -3,6 +3,4 @@ added:
 - Add I/O error recovery watchdog - free space first, then resume VMs paused by io-error (@yorkhost-fr). [#0]
 - Add '--storage-report' CLI option printing storage fill levels and forecast (@yorkhost-fr). [#0]
 changed:
-- Collect node, guest and storage metrics concurrently with a single RRD request per metric type (parallel_requests) (@yorkhost-fr). [#0]
-fixed:
-- Fix container RRD metrics being read from the qemu endpoint (@yorkhost-fr). [#0]
+- Collect node, guest and storage metrics concurrently (parallel_requests) and without per-request sleeps (@yorkhost-fr). [#0]

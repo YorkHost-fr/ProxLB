@@ -86,19 +86,11 @@ def test_parallel_map_keeps_order() -> None:
     assert Helper.parallel_map(lambda x: x + 1, [1, 2], 1) == [2, 3]
 
 
-def test_rrd_helpers() -> None:
-    rows = [{"pressurecpusome": float(i)} for i in range(10)] + [{"pressurecpusome": None}]
-    assert Nodes.rrd_average(rows, "pressurecpusome") == sum(range(10)) / 11
-    assert Nodes.rrd_spike(rows, "pressurecpusome") == 9.0
-    assert Nodes.rrd_average([], "x") == 0.0
-    assert Nodes.rrd_spike([], "x") == 0.0
-
-
 def test_container_rrd_uses_lxc_endpoint() -> None:
     api = MagicMock()
     api.nodes.return_value.lxc.return_value.rrddata.get.return_value = [{"cpu": 0.5}]
-    rows = Guests.get_guest_rrd_rows(api, "pve1", 101, Config.GuestType.Ct, "AVERAGE")
-    assert rows == [{"cpu": 0.5}]
+    datasets = Guests.get_guest_rrd_datasets(api, "pve1", 101, "ct101", Config.GuestType.Ct)
+    assert datasets.average == [{"cpu": 0.5}]
     api.nodes.return_value.qemu.assert_not_called()
 
 
