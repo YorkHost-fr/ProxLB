@@ -10,6 +10,7 @@ proxmox_api:
   # API Connection retries
   # retries: 1
   # wait_time: 1
+  parallel_requests: 8                # Concurrent API requests while collecting metrics (1 = sequential)
 
 proxmox_cluster:
   maintenance_nodes: ['virt66.example.com']
@@ -100,6 +101,37 @@ balancing:
         - virt66
         - virt77
       strict: False                   # Disable strict mode of node pinning for this pool
+
+# Storage aware balancing: detect full / soon full storages and fix them.
+# Escalation: 1) fstrim via guest agent (discard=on disks) 2) live disk move to
+# another storage of the same node 3) migrate the guest to another node.
+storage_balancing:
+  enable: True
+  warning_percent: 80                 # Report storages above this fill level
+  critical_percent: 90                # Act on storages above this fill level
+  target_max_percent: 75              # Aim for this level; never fill a destination above it
+  forecast: True                      # Also act on storages forecast to hit critical_percent...
+  forecast_days: 7                    # ...within this many days
+  forecast_timeframe: week            # RRD history used for the trend: hour | day | week | month | year
+  strategy: disk_move_first           # disk_move_first | migrate_first
+  allow_disk_move: True               # VMs only (Proxmox can't move volumes of running CTs)
+  allow_node_migration: True          # Honors balancing.balance_types, pinning and (anti-)affinity
+  fstrim: True                        # Run fstrim in the guest first (needs agent + discard=on)
+  delete_source: True                 # Delete the source volume after a successful disk move
+  max_actions_per_run: 5
+  parallel_moves: 1
+  # bwlimit: 102400                   # Optional disk move bandwidth limit in KiB/s
+  exclude_storages: []
+
+# Automatic recovery of VMs paused by an I/O error (e.g. full thin pool).
+# Space is freed first; a VM is only resumed once its storages have room again.
+io_error_recovery:
+  enable: True
+  interval: 60                        # Watchdog interval (seconds) between balancing runs
+  resume_paused: False                # Also resume VMs in plain 'paused' state
+  min_free_percent: 2                 # Don't resume while a VM storage has less free space...
+  min_free_gib: 1                     # ...than max(min_free_percent, min_free_gib)
+  max_resume_attempts: 3              # Per VM and per hour, then give up and alert
 
 service:
   daemon: True

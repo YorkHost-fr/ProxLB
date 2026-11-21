@@ -56,6 +56,9 @@ class Config(BaseModel):
         token_secret: Optional[str] = None
         username: str = Field(alias="user")
         wait_time: int = 1
+        # Number of concurrent API requests used while collecting node, guest
+        # and storage metrics. 1 restores the former sequential behaviour.
+        parallel_requests: int = Field(default=8, ge=1)
 
     class ProxmoxCluster(BaseModel):
         class MaintenanceNodesSchedule(BaseModel):
@@ -234,6 +237,82 @@ class Config(BaseModel):
         log_level: "Config.Service.LogLevel" = LogLevel.INFO
         schedule: Schedule = Schedule()
 
+    class StorageBalancing(BaseModel):
+        """
+        Storage-aware balancing: detects storages that are full or that are
+        forecast to become full (linear trend over the Proxmox storage RRD
+        history) and relieves them by moving guest disks to another storage on
+        the same node (VMs, live 'move_disk') or by migrating the guest to
+        another node together with its local disks.
+        """
+        class Strategy(StrEnum):
+            DiskMoveFirst = "disk_move_first"
+            MigrateFirst = "migrate_first"
+
+        class Timeframe(StrEnum):
+            Hour = "hour"
+            Day = "day"
+            Week = "week"
+            Month = "month"
+            Year = "year"
+
+        enable: bool = False
+        # A storage at or above warning_percent is reported, at or above
+        # critical_percent it is considered full and ProxLB acts on it.
+        warning_percent: float = Field(default=80.0, gt=0, le=100)
+        critical_percent: float = Field(default=90.0, gt=0, le=100)
+        # Fill level ProxLB aims for on a relieved storage, and the maximum fill
+        # level accepted on a destination storage after a move.
+        target_max_percent: float = Field(default=75.0, gt=0, le=100)
+        # Forecast: act on storages expected to reach critical_percent within
+        # forecast_days, based on the growth trend of forecast_timeframe.
+        forecast: bool = True
+        forecast_days: float = Field(default=7.0, ge=0)
+        forecast_timeframe: Timeframe = Timeframe.Week
+        strategy: Strategy = Strategy.DiskMoveFirst
+        allow_disk_move: bool = True
+        allow_node_migration: bool = True
+        delete_source: bool = True
+        max_actions_per_run: int = Field(default=5, ge=1)
+        parallel_moves: int = Field(default=1, ge=1)
+        max_move_time: int = Field(default=7200, ge=60)
+        # Optional bandwidth limit for disk moves in KiB/s (Proxmox 'bwlimit').
+        bwlimit: Optional[int] = Field(default=None, ge=1)
+        exclude_storages: list[str] = []
+        # Before moving any data, ask the QEMU guest agent to run fstrim on VMs
+        # whose disks on the full storage have 'discard=on'. This hands freed
+        # blocks back to thin pools (lvmthin, zfs, ceph, qcow2...) without any
+        # data movement and is tried first.
+        fstrim: bool = True
+        fstrim_timeout: int = Field(default=600, ge=10)
+
+        @model_validator(mode="after")
+        def _validate_thresholds(self) -> "Config.StorageBalancing":
+            if self.warning_percent > self.critical_percent:
+                raise ValueError("storage_balancing.warning_percent must be <= critical_percent")
+            if self.target_max_percent >= self.critical_percent:
+                raise ValueError("storage_balancing.target_max_percent must be < critical_percent")
+            return self
+
+    class IoErrorRecovery(BaseModel):
+        """
+        Automatic recovery of VMs paused by QEMU because of an I/O error
+        (typically a full thin pool / storage). A lightweight watchdog scans the
+        VMs every 'interval' seconds between two balancing runs (daemon mode),
+        frees space first when the VM's storage is full, then resumes the VM.
+        """
+        enable: bool = False
+        interval: int = Field(default=60, ge=10)
+        # Also resume VMs in plain 'paused' state (not only 'io-error'). Off by
+        # default since a VM may have been paused on purpose by an operator.
+        resume_paused: bool = False
+        # Never resume a VM while one of its storages still has less free space
+        # than this; it would hit the I/O error again immediately.
+        min_free_percent: float = Field(default=2.0, ge=0, le=100)
+        min_free_gib: float = Field(default=1.0, ge=0)
+        # Give up on a VM after this many resumes within one hour.
+        max_resume_attempts: int = Field(default=3, ge=1)
+
     class Solver(BaseModel):
         class Mode(StrEnum):
             Active = "active"
@@ -251,6 +330,8 @@ class Config(BaseModel):
     balancing: Balancing = Field(default_factory=Balancing)
     service: Service = Field(default_factory=Service)
     solver: Solver = Field(default_factory=Solver)
+    storage_balancing: StorageBalancing = Field(default_factory=StorageBalancing)
+    io_error_recovery: IoErrorRecovery = Field(default_factory=IoErrorRecovery)
 
     @model_validator(mode="after")
     def _validate_method_requires_solver(self) -> "Config":

@@ -317,6 +317,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | timeout |  | 10 | `Int` | Timeout for the Proxmox API in sec. |
 |  | retries |  | 1 | `Int` | How often a connection attempt to the defined API host should be performed. |
 |  | wait_time |  | 1 | `Int` | How many seconds should be waited before performing another connection attempt to the API host. |
+|  | parallel_requests |  | 8 | `Int` | Number of concurrent API requests while collecting node, guest and storage metrics. `1` restores sequential collection. |
 | `proxmox_cluster` |  |  |  |  |  |
 |  | maintenance_nodes |  | ['virt66.example.com'] | `List` | A list of Proxmox nodes that are defined to be in a maintenance. (must be the same node names as used within the cluster) |
 |  | maintenance_nodes_schedule |  |  | `Dict` | A weekly schedule that temporarily adds nodes to `maintenance_nodes` during runtime. |
@@ -347,6 +348,31 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | node_resource_reserve |  | { default: { memory: 4 }, { node01: { memory: 6 }} } | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
+| `storage_balancing` |  |  |  |  |  |
+|  | enable |  | False | `Bool` | Detect full / soon-full storages and relieve them (fstrim, disk move, migration). See [Storage Balancing](docs/03_configuration.md#storage-balancing--io-error-recovery). |
+|  | warning_percent |  | 80 | `Float` | Fill level from which a storage is reported. |
+|  | critical_percent |  | 90 | `Float` | Fill level from which a storage is considered full and relieved. |
+|  | target_max_percent |  | 75 | `Float` | Fill level aimed for on a relieved storage and maximum fill level accepted on a destination storage. Must be lower than `critical_percent`. |
+|  | forecast |  | True | `Bool` | Also relieve storages forecast (linear trend of the RRD history) to reach `critical_percent` within `forecast_days`. |
+|  | forecast_days |  | 7 | `Float` | Forecast horizon in days. |
+|  | forecast_timeframe |  | week | `Str` | RRD history used for the trend. [values: `hour`, `day`, `week` (default), `month`, `year`] |
+|  | strategy |  | disk_move_first | `Str` | Order of the relief steps after fstrim. [values: `disk_move_first` (default), `migrate_first`] |
+|  | allow_disk_move |  | True | `Bool` | Allow live moves of VM disks to another storage of the same node. |
+|  | allow_node_migration |  | True | `Bool` | Allow migrating a guest (with its local disks) to another node. Honors `balancing.balance_types`, pinning and (anti-)affinity. |
+|  | fstrim |  | True | `Bool` | Run fstrim through the QEMU guest agent first, for VMs with `discard=on` disks on a full thin storage. |
+|  | delete_source |  | True | `Bool` | Delete the source volume after a successful disk move. |
+|  | max_actions_per_run |  | 5 | `Int` | Maximum number of disk moves / migrations planned per run. |
+|  | parallel_moves |  | 1 | `Int` | Number of concurrent disk moves (never two on the same VM). |
+|  | max_move_time |  | 7200 | `Int` | Seconds after which a disk move is reported as timed out. |
+|  | bwlimit |  |  | `Int` | Optional bandwidth limit for disk moves in KiB/s. |
+|  | exclude_storages |  | [] | `List` | Storage ids never touched by the storage balancer. |
+| `io_error_recovery` |  |  |  |  |  |
+|  | enable |  | False | `Bool` | Watchdog recovering VMs paused by an I/O error: frees space first, resumes the VM only once its storages have room again. |
+|  | interval |  | 60 | `Int` | Seconds between two watchdog scans while waiting for the next balancing run (daemon mode). |
+|  | resume_paused |  | False | `Bool` | Also resume VMs in plain `paused` state (not only `io-error`). |
+|  | min_free_percent |  | 2 | `Float` | A VM is not resumed while one of its storages has less free space than `max(min_free_percent, min_free_gib)`. |
+|  | min_free_gib |  | 1 | `Float` | See `min_free_percent`. |
+|  | max_resume_attempts |  | 3 | `Int` | Maximum resumes per VM and hour before giving up and alerting. |
 | `service` |  |  |  |  |  |
 |  | daemon |  | True | `Bool` | If daemon mode should be activated. |
 |  | enable_ha |  | False | `Bool` | Enables HA mode of ProxLB. |

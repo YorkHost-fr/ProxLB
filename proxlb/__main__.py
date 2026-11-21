@@ -14,6 +14,7 @@ __license__ = "GPL-3.0"
 
 import logging
 import signal
+import sys
 
 from proxlb_solver import shadow as _solver_shadow
 from proxlb_solver.models import MigrationPlan
@@ -31,6 +32,9 @@ from proxlb.models.balancing import Balancing
 from proxlb.models.pools import Pools
 from proxlb.models.ha_rules import HaRules
 from proxlb.models.ha_status import HaStatus
+from proxlb.models.io_recovery import IoRecovery
+from proxlb.models.storages import Storages
+from proxlb.models.storage_balancing import StorageBalancing
 from proxlb.utils.helper import Helper
 from proxlb.utils.proxlb_data import ProxLbData
 
@@ -66,6 +70,31 @@ proxmox_api = ProxmoxApi(proxlb_config)
 # Overwrite password after creating the API object
 proxlb_config.proxmox_api.password = "********"
 proxlb_config.proxmox_api.token_secret = "********"
+
+# Fast storage report: storages only, no guest metrics, then exit.
+if cli_args.storage_report:
+    _report_nodes = [
+        n["node"] for n in proxmox_api.nodes.get()
+        if n.get("status") == "online" and n["node"] not in proxlb_config.proxmox_cluster.ignore_nodes
+    ]
+    print(Storages.format_report(Storages.get_storages(
+        proxmox_api, _report_nodes, proxlb_config.storage_balancing,
+        proxlb_config.proxmox_api.parallel_requests)))
+    sys.exit(0)
+
+
+def watchdog() -> bool:
+    """
+    Lightweight check executed between two balancing runs in daemon mode:
+    recovers VMs paused by I/O errors. Returns True to request an immediate
+    balancing run (a storage became full).
+    """
+    if proxlb_config.service.enable_ha and not HaStatus.is_node_ha_manager(proxmox_api):
+        return False
+    IoRecovery.run(proxmox_api, proxlb_config, dry_run=cli_args.dry_run)
+    requested = IoRecovery.emergency_run
+    IoRecovery.emergency_run = False
+    return requested
 
 
 def reinstall_sigint() -> None:
@@ -108,6 +137,8 @@ while True:
     ha_rules = HaRules.get_ha_rules(proxmox_api, meta)
     guests = Guests.get_guests(proxmox_api, pools, ha_rules, nodes, proxlb_config)
     groups = Groups.get_groups(guests, nodes)
+    workers = proxlb_config.proxmox_api.parallel_requests
+    storage_cfg = proxlb_config.storage_balancing
 
     # Merge obtained objects from the Proxmox cluster for further usage
     proxlb_data = ProxLbData(
@@ -119,6 +150,21 @@ while True:
         groups=groups,
     )
     Helper.log_node_metrics(proxlb_data)
+
+    # Storage awareness: detect full / soon full storages. The non-disruptive
+    # relief (fstrim through the guest agent) runs first, then the storage
+    # usage is re-read before any disk move or migration is planned.
+    if storage_cfg.enable:
+        proxlb_data.storages = Storages.get_storages(proxmox_api, list(nodes.keys()), storage_cfg, workers)
+        Storages.log_status(proxlb_data.storages)
+        fstrim_actions = StorageBalancing.plan_fstrim(proxlb_data)
+        if fstrim_actions:
+            proxlb_data.storage_actions.extend(fstrim_actions)
+            if not cli_args.dry_run:
+                StorageBalancing.execute_fstrim(proxmox_api, fstrim_actions, workers)
+                Storages.refresh_usage(proxmox_api, proxlb_data.storages, storage_cfg, workers)
+                Storages.log_status(proxlb_data.storages)
+        Storages.fill_volume_usage(proxmox_api, proxlb_data, workers)
 
     # Validate usable features by PVE versions
     Features.validate_available_features(proxlb_data)
@@ -138,6 +184,10 @@ while True:
         Calculations.get_balanciness(proxlb_data)
         Calculations.relocate_guests(proxlb_data)
 
+        # Storage relief: disk moves (same node) and migrations (other node).
+        if storage_cfg.enable:
+            StorageBalancing.plan(proxlb_data, respect_planned_moves=proxlb_data.meta.balancing.enable)
+
         # CP-SAT solver (optional) — shadow (read-only) or active mode.
         _solver_cfg = proxlb_config.solver
         _run_file: str | None = None
@@ -149,6 +199,17 @@ while True:
             reinstall_sigint()
 
         Helper.log_node_metrics(proxlb_data, init=False)
+
+        # Storage relief first: live disk moves on the same node.
+        storage_migrations = StorageBalancing.migration_guest_names(proxlb_data)
+        if storage_cfg.enable and not cli_args.dry_run:
+            StorageBalancing.execute_disk_moves(proxmox_api, proxlb_data)
+            if storage_migrations and not proxlb_data.meta.balancing.enable:
+                # Resource balancing is off: only run the storage-driven migrations.
+                Balancing.balance(proxmox_api, proxlb_data, guest_names=storage_migrations)
+            if storage_migrations and proxlb_data.meta.balancing.enable and _solver_cfg.enable and _solver_cfg.mode == "active":
+                logger.warning("Storage-driven migrations are not executed while the CP-SAT solver runs in active "
+                               f"mode: {', '.join(storage_migrations)}. Disk moves were executed.")
 
         # Perform balancing actions via Proxmox API
         if proxlb_data.meta.balancing.enable:
@@ -177,9 +238,17 @@ while True:
                 logger.warning(f"[solver] finalize_run failed: {exc}")
             reinstall_sigint()
 
+    # Resume VMs paused by I/O errors now that space may have been freed.
+    if proxlb_config.io_error_recovery.enable:
+        try:
+            IoRecovery.run(proxmox_api, proxlb_config, dry_run=cli_args.dry_run)
+        except Exception as exc:
+            logger.error(f"IoRecovery failed: {exc}")
+        IoRecovery.emergency_run = False
+
     # Validate if the JSON output should be
     # printed to stdout
     Helper.print_json(proxlb_data, cli_args.json)
     # Validate daemon mode
-    Helper.get_daemon_mode(proxlb_config)
+    Helper.get_daemon_mode(proxlb_config, watchdog)
     logger.debug("Finished: __main__")

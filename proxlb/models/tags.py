@@ -10,8 +10,7 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
-import time
-from typing import Dict, List, assert_never
+from typing import Any, Dict, List, assert_never
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.helper import Helper
 from proxlb.utils.config_parser import Config
@@ -70,21 +69,25 @@ class Tags:
             List: A list of all tags assoiciated with the given guest.
         """
         logger.debug("Starting: get_tags_from_guests.")
-        time.sleep(0.1)
-        api_tags: str
         if guest_type == GuestType.Vm:
             guest_config = proxmox_api.nodes(node).qemu(guest_id).config.get()
-            api_tags = guest_config.get("tags", "")
         elif guest_type == GuestType.Ct:
             guest_config = proxmox_api.nodes(node).lxc(guest_id).config.get()
-            api_tags = guest_config.get("tags", "")
         else:
             assert_never(guest_type)
 
-        tags = api_tags.split(";") if isinstance(api_tags, str) else []
+        tags = Tags.parse_tags(guest_config)
 
         logger.debug("Finished: get_tags_from_guests.")
         return tags
+
+    @staticmethod
+    def parse_tags(guest_config: Dict[str, Any]) -> List[str]:
+        """
+        Extract the tag list from an already fetched guest configuration.
+        """
+        api_tags = guest_config.get("tags", "")
+        return [tag for tag in api_tags.split(";") if tag] if isinstance(api_tags, str) else []
 
     @staticmethod
     def get_affinity_groups(tags: List[str], pools: List[str], ha_rules: List[ProxLbData.HaRule], proxlb_config: Config) -> List[str]:

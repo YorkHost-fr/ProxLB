@@ -8,7 +8,8 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+from proxlb.utils.helper import Helper
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxmox_api import ProxmoxApi
 from proxlb.utils.config_parser import Config
@@ -16,7 +17,8 @@ from proxlb.utils.proxlb_data import ProxLbData
 from proxlb.models.pools import Pools
 from proxlb.models.ha_rules import HaRules
 from proxlb.models.tags import Tags
-import time
+from proxlb.models.nodes import Nodes
+from proxlb.models.storages import Storages
 
 GuestType = Config.GuestType
 
@@ -47,15 +49,15 @@ class Guests:
         Get metrics of all guests in a Proxmox cluster.
 
         This method retrieves metrics for all running guests (both VMs and CTs) across all nodes in the Proxmox cluster.
-        It iterates over each node and collects resource metrics for each running guest, including CPU, memory, and disk usage.
-        Additionally, it retrieves tags and affinity/anti-affinity groups for each guest.
+        Per guest only three API calls are issued (config, RRD average, RRD max) and they run
+        concurrently (proxmox_api.parallel_requests). The guest config provides the tags as
+        well as the disk layout used by the storage balancer.
 
         Args:
             proxmox_api (any): The Proxmox API client instance.
             pools (Dict[str, Any]): A dictionary containing information about the pools in the Proxmox cluster.
             ha_rules (Dict[str, Any]): A dictionary containing information about the HA rules in the
             nodes (Dict[str, Any]): A dictionary containing information about the nodes in the Proxmox cluster.
-            meta (Dict[str, Any]): A dictionary containing metadata information.
             proxmox_config (Dict[str, Any]): A dictionary containing the ProxLB configuration.
 
         Returns:
@@ -63,182 +65,117 @@ class Guests:
         """
         logger.debug("Starting: get_guests.")
         guests: Dict[str, ProxLbData.Guest] = {}
+        workers = proxlb_config.proxmox_api.parallel_requests
 
-        # Guest objects are always only in the scope of a node.
-        # Therefore, we need to iterate over all nodes to get all guests.
-        for node in nodes.keys():
+        # Guest objects are always only in the scope of a node. List all of them
+        # concurrently. Unlike the nodes we need to keep guests even when being
+        # ignored to create proper resource metrics for rebalancing to ensure
+        # that we do not overprovision the node.
+        def list_node(node: str) -> list[tuple[str, GuestType, dict[str, Any]]]:
+            listed: list[tuple[str, GuestType, dict[str, Any]]] = []
+            for guest_type, endpoint in ((GuestType.Vm, "qemu"), (GuestType.Ct, "lxc")):
+                for guest in getattr(proxmox_api.nodes(node), endpoint).get():
+                    if guest['status'] == 'running':
+                        listed.append((node, guest_type, guest))
+                    else:
+                        logger.debug(f'Metric for {guest_type} {guest.get("name")} ignored because guest is not running.')
+            return listed
 
-            # VM objects: Iterate over all VMs on the current node by the qemu API object.
-            # Unlike the nodes we need to keep them even when being ignored to create proper
-            # resource metrics for rebalancing to ensure that we do not overprovisiong the node.
-            for guest in proxmox_api.nodes(node).qemu.get():
-                if guest['status'] == 'running':
+        running = [entry for listed in Helper.parallel_map(list_node, list(nodes.keys()), workers) for entry in listed]
 
-                    guest_tags = Tags.get_tags_from_guests(proxmox_api, node, guest['vmid'], GuestType.Vm)
-                    guest_pools = Pools.get_pools_for_guest(guest['name'], pools)
-                    guest_ha_rules = HaRules.get_ha_rules_for_guest(guest['name'], ha_rules, guest['vmid'])
+        def fetch(entry: tuple[str, GuestType, dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+            node, guest_type, guest = entry
+            return (
+                Guests.get_guest_config(proxmox_api, node, guest['vmid'], guest_type),
+                Guests.get_guest_rrd_rows(proxmox_api, node, guest['vmid'], guest_type, "AVERAGE"),
+                Guests.get_guest_rrd_rows(proxmox_api, node, guest['vmid'], guest_type, "MAX"),
+            )
 
-                    guests[guest['name']] = ProxLbData.Guest(
-                        name=guest['name'],
-                        cpu=ProxLbData.Guest.Metric(
-                            total=int(guest['cpus']),
-                            used=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', None),
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        disk=ProxLbData.Guest.Metric(
-                            total=guest['maxdisk'],
-                            used=guest['disk'],
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        memory=ProxLbData.Guest.Metric(
-                            total=guest['maxmem'],
-                            used=guest['mem'],
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        id=guest['vmid'],
-                        node_current=node,
-                        node_target=node,
-                        processed=False,
-                        pressure_hot=False,
-                        tags=guest_tags,
-                        pools=guest_pools,
-                        ha_rules=guest_ha_rules,
-                        affinity_groups=Tags.get_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
-                        anti_affinity_groups=Tags.get_anti_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
-                        ignore=Tags.get_ignore(guest_tags),
-                        node_relationships=Tags.get_node_relationships(guest_tags, nodes, guest_pools, guest_ha_rules, proxlb_config),
-                        node_relationships_strict=Pools.get_pool_node_affinity_strictness(proxlb_config, guest_pools),
-                        type=GuestType.Vm,
-                    )
+        fetched = Helper.parallel_map(fetch, running, workers)
 
-                    logger.debug(f"Resources of Guest {guest['name']} (type VM) added: {guests[guest['name']]}")
-                else:
-                    logger.debug(f'Metric for VM {guest["name"]} ignored because VM is not running.')
+        for (node, guest_type, guest), (guest_config, rrd_avg, rrd_max) in zip(running, fetched):
+            guest_tags = Tags.parse_tags(guest_config)
+            guest_pools = Pools.get_pools_for_guest(guest['name'], pools)
+            guest_ha_rules = HaRules.get_ha_rules_for_guest(guest['name'], ha_rules, guest['vmid'])
 
-            # CT objects: Iterate over all VMs on the current node by the lxc API object.
-            # Unlike the nodes we need to keep them even when being ignored to create proper
-            # resource metrics for rebalancing to ensure that we do not overprovisiong the node.
-            for guest in proxmox_api.nodes(node).lxc.get():
-                if guest['status'] == 'running':
+            def metric(object_name: str, total: int, used: float) -> ProxLbData.Guest.Metric:
+                return ProxLbData.Guest.Metric(
+                    total=total,
+                    used=used,
+                    pressure_some_percent=Nodes.rrd_average(rrd_avg, f"pressure{object_name}some"),
+                    pressure_full_percent=Nodes.rrd_average(rrd_avg, f"pressure{object_name}full"),
+                    pressure_some_spikes_percent=Nodes.rrd_spike(rrd_max, f"pressure{object_name}some"),
+                    pressure_full_spikes_percent=Nodes.rrd_spike(rrd_max, f"pressure{object_name}full"),
+                    pressure_hot=False,
+                )
 
-                    guest_tags = Tags.get_tags_from_guests(proxmox_api, node, guest['vmid'], GuestType.Ct)
-                    guest_pools = Pools.get_pools_for_guest(guest['name'], pools)
-                    guest_ha_rules = HaRules.get_ha_rules_for_guest(guest['name'], ha_rules, guest['vmid'])
+            volumes, unused_volumes = Storages.parse_guest_volumes(guest_config, guest_type)
 
-                    guests[guest['name']] = ProxLbData.Guest(
-                        cpu=ProxLbData.Guest.Metric(
-                            total=int(guest['cpus']),
-                            used=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', None),
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'cpu', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        disk=ProxLbData.Guest.Metric(
-                            total=guest['maxdisk'],
-                            used=guest['disk'],
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'disk', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        memory=ProxLbData.Guest.Metric(
-                            total=guest['maxmem'],
-                            used=guest['mem'],
-                            pressure_some_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'some'),
-                            pressure_full_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'full'),
-                            pressure_some_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'some', spikes=True),
-                            pressure_full_spikes_percent=Guests.get_guest_rrd_data(proxmox_api, node, guest['vmid'], guest['name'], 'memory', 'full', spikes=True),
-                            pressure_hot=False,
-                        ),
-                        name=guest['name'],
-                        id=guest['vmid'],
-                        node_current=node,
-                        node_target=node,
-                        processed=False,
-                        pressure_hot=False,
-                        tags=guest_tags,
-                        pools=guest_pools,
-                        ha_rules=guest_ha_rules,
-                        affinity_groups=Tags.get_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
-                        anti_affinity_groups=Tags.get_anti_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
-                        ignore=Tags.get_ignore(guest_tags),
-                        node_relationships=Tags.get_node_relationships(guest_tags, nodes, guest_pools, guest_ha_rules, proxlb_config),
-                        node_relationships_strict=Pools.get_pool_node_affinity_strictness(proxlb_config, guest_pools),
-                        type=GuestType.Ct,
-                    )
+            guests[guest['name']] = ProxLbData.Guest(
+                name=guest['name'],
+                cpu=metric('cpu', int(guest['cpus']), Nodes.rrd_average(rrd_avg, 'cpu')),
+                disk=metric('disk', guest['maxdisk'], guest['disk']),
+                memory=metric('memory', guest['maxmem'], guest['mem']),
+                id=guest['vmid'],
+                node_current=node,
+                node_target=node,
+                processed=False,
+                pressure_hot=False,
+                tags=guest_tags,
+                pools=guest_pools,
+                ha_rules=guest_ha_rules,
+                affinity_groups=Tags.get_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
+                anti_affinity_groups=Tags.get_anti_affinity_groups(guest_tags, guest_pools, guest_ha_rules, proxlb_config),
+                ignore=Tags.get_ignore(guest_tags),
+                node_relationships=Tags.get_node_relationships(guest_tags, nodes, guest_pools, guest_ha_rules, proxlb_config),
+                node_relationships_strict=Pools.get_pool_node_affinity_strictness(proxlb_config, guest_pools),
+                type=guest_type,
+                volumes=volumes,
+                unused_volumes=unused_volumes,
+                agent=Storages.agent_enabled(guest_config),
+                lock=guest_config.get('lock') or guest.get('lock'),
+            )
 
-                    logger.debug(f"Resources of Guest {guest['name']} (type CT) added: {guests[guest['name']]}")
-                else:
-                    logger.debug(f'Metric for CT {guest["name"]} ignored because CT is not running.')
+            logger.debug(f"Resources of Guest {guest['name']} (type {guest_type}) added: {guests[guest['name']]}")
 
         logger.debug("Finished: get_guests.")
         return guests
 
     @staticmethod
+    def get_guest_config(proxmox_api: ProxmoxApi, node_name: str, vm_id: int, guest_type: GuestType) -> dict[str, Any]:
+        """
+        Fetch the configuration of a guest (used for tags and disk layout).
+        """
+        try:
+            if guest_type == GuestType.Vm:
+                return dict(proxmox_api.nodes(node_name).qemu(vm_id).config.get())
+            return dict(proxmox_api.nodes(node_name).lxc(vm_id).config.get())
+        except Exception as exc:
+            logger.error(f"Failed to retrieve config of guest {vm_id} on node {node_name}: {exc}")
+            return {}
+
+    @staticmethod
+    def get_guest_rrd_rows(proxmox_api: ProxmoxApi, node_name: str, vm_id: int, guest_type: GuestType, cf: str) -> list[dict[str, Any]]:
+        """
+        Fetch the last hour of RRD rows of a guest once (cf: 'AVERAGE' or 'MAX').
+        Containers are queried on the 'lxc' endpoint (formerly the 'qemu'
+        endpoint was used for every guest, which returned no data for CTs).
+        """
+        try:
+            if guest_type == GuestType.Vm:
+                return list(proxmox_api.nodes(node_name).qemu(vm_id).rrddata.get(timeframe="hour", cf=cf))
+            return list(proxmox_api.nodes(node_name).lxc(vm_id).rrddata.get(timeframe="hour", cf=cf))
+        except Exception:
+            logger.error(f"Failed to retrieve RRD data ({cf}) for guest ID {vm_id} on node: {node_name}. Using 0.0 as value.")
+            return []
+
+    @staticmethod
     def get_guest_rrd_data(proxmox_api: ProxmoxApi, node_name: str, vm_id: int, vm_name: str, object_name: str, object_type: Optional[str], spikes: bool = False) -> float:
         """
-        Retrieves the rrd data metrics for a specific resource (CPU, memory, disk) of a guest VM or CT.
-
-        Args:
-            proxmox_api (Any): The Proxmox API client instance.
-            node_name (str): The name of the node hosting the guest.
-            vm_id (int): The ID of the guest VM or CT.
-            vm_name (str): The name of the guest VM or CT.
-            object_name (str): The resource type to query (e.g., 'cpu', 'memory', 'disk').
-            object_type (str, optional): The pressure type ('some', 'full') or None for average usage.
-            spikes (bool, optional): Whether to consider spikes in the calculation. Defaults to False.
-
-        Returns:
-            float: The calculated average usage value for the specified resource.
+        Retrieves a single RRD metric of a VM (kept for backwards compatibility;
+        get_guests fetches the RRD rows only once per guest).
         """
-        logger.debug("Starting: get_guest_rrd_data.")
-        time.sleep(0.1)
-
-        try:
-            if spikes:
-                logger.debug(f"Getting spike RRD data for {object_name} from guest: {vm_name}.")
-                guest_data_rrd = proxmox_api.nodes(node_name).qemu(vm_id).rrddata.get(timeframe="hour", cf="MAX")
-            else:
-                logger.debug(f"Getting average RRD data for {object_name} from guest: {vm_name}.")
-                guest_data_rrd = proxmox_api.nodes(node_name).qemu(vm_id).rrddata.get(timeframe="hour", cf="AVERAGE")
-        except Exception:
-            logger.error(f"Failed to retrieve RRD data for guest: {vm_name} (ID: {vm_id}) on node: {node_name}. Using 0.0 as value.")
-            logger.debug("Finished: get_guest_rrd_data.")
-            return float(0.0)
-
-        if object_type:
-
-            lookup_key = f"pressure{object_name}{object_type}"
-            if spikes:
-                # RRD data is collected every minute, so we look at the last 6 entries
-                # and take the maximum value to represent the spike
-                logger.debug(f"Getting RRD data (spike: {spikes}) of pressure for {object_name} {object_type} from guest: {vm_name}.")
-                _rrd_data_value = [row.get(lookup_key) for row in guest_data_rrd if row.get(lookup_key) is not None]
-                rrd_data_value = max(_rrd_data_value[-6:], default=0.0)
-            else:
-                # Calculate the average value from the RRD data entries
-                logger.debug(f"Getting RRD data (spike: {spikes}) of pressure for {object_name} {object_type} from guest: {vm_name}.")
-                rrd_data_value = sum(entry.get(lookup_key, 0.0) for entry in guest_data_rrd) / len(guest_data_rrd)
-
-        else:
-            logger.debug(f"Getting RRD data of cpu usage from guest: {vm_name}.")
-            rrd_data_value = sum(entry.get("cpu", 0.0) for entry in guest_data_rrd) / len(guest_data_rrd)
-
-        logger.debug(f"RRD data (spike: {spikes}) for {object_name} from guest: {vm_name}: {rrd_data_value}")
-        logger.debug("Finished: get_guest_rrd_data.")
-        return rrd_data_value
+        lookup_key = f"pressure{object_name}{object_type}" if object_type else "cpu"
+        if spikes:
+            return Nodes.rrd_spike(Guests.get_guest_rrd_rows(proxmox_api, node_name, vm_id, GuestType.Vm, "MAX"), lookup_key)
+        return Nodes.rrd_average(Guests.get_guest_rrd_rows(proxmox_api, node_name, vm_id, GuestType.Vm, "AVERAGE"), lookup_key)

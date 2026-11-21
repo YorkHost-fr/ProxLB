@@ -19,12 +19,16 @@ from proxlb.utils import version
 from proxlb.utils.config_parser import Config
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
-from typing import Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, Iterable, Tuple, Optional, TypeVar
 from types import FrameType
 
 BalancingResource = Config.Balancing.Resource
 
 logger = SystemdLogger()
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 
 class Helper:
@@ -128,12 +132,34 @@ class Helper:
             sys.exit(0)
 
     @staticmethod
-    def get_daemon_mode(proxlb_config: Config) -> None:
+    def parallel_map(func: Callable[[_T], _R], items: Iterable[_T], workers: int) -> list[_R]:
+        """
+        Apply `func` to every item using a bounded thread pool and return the
+        results in input order. API calls are I/O bound, so threads give a near
+        linear speed-up up to the number of workers. With workers <= 1 the
+        items are processed sequentially. Exceptions raised by `func` are
+        propagated to the caller.
+        """
+        items = list(items)
+        if workers <= 1 or len(items) <= 1:
+            return [func(item) for item in items]
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as executor:
+            return list(executor.map(func, items))
+
+    @staticmethod
+    def get_daemon_mode(proxlb_config: Config, watchdog: Optional[Callable[[], bool]] = None) -> None:
         """
         Checks if the daemon mode is active and handles the scheduling accordingly.
 
+        When a `watchdog` callback is given and I/O-error recovery is enabled,
+        the wait until the next balancing run is split into intervals of
+        io_error_recovery.interval seconds and the watchdog runs after each one.
+        When the watchdog returns True the wait ends early so the next
+        balancing run starts immediately (e.g. a storage became full).
+
         Parameters:
             proxlb_config (Dict[str, Any]): A dictionary containing the ProxLB configuration.
+            watchdog (Callable, optional): Lightweight check executed between runs.
 
         Returns:
             None
@@ -142,7 +168,22 @@ class Helper:
         if proxlb_config.service.daemon:
 
             logger.info(f"Daemon mode active: Next run in: {proxlb_config.service.schedule}.")
-            time.sleep(proxlb_config.service.schedule.seconds)
+            remaining = proxlb_config.service.schedule.seconds
+            if watchdog is not None and proxlb_config.io_error_recovery.enable:
+                interval = proxlb_config.io_error_recovery.interval
+                while remaining > 0 and not Helper.proxlb_reload:
+                    step = min(interval, remaining)
+                    time.sleep(step)
+                    remaining -= step
+                    if remaining > 0:
+                        try:
+                            if watchdog():
+                                logger.warning("Watchdog requested an immediate run.")
+                                break
+                        except Exception as exc:
+                            logger.error(f"Watchdog run failed: {exc}")
+            else:
+                time.sleep(remaining)
 
         else:
             logger.debug("Successfully executed ProxLB. Daemon mode not active - stopping.")
