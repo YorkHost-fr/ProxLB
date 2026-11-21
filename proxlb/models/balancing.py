@@ -12,6 +12,7 @@ __license__ = "GPL-3.0"
 
 import proxmoxer
 import time
+from proxlb.utils.helper import Helper, NodeUnavailableError
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxmox_api import ProxmoxApi
 from proxlb.utils.config_parser import Config
@@ -96,20 +97,30 @@ class Balancing:
         hamigrate_starttime: Optional[int] = None
 
     @staticmethod
-    def balance(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData) -> bool:
+    def balance(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
+                guest_names: Optional[list[str]] = None) -> bool:
         """
         Runs the streaming migration queue.
 
         Keeps up to parallel_job_limit migrations in flight at once and immediately
         submits the next guest as soon as a slot becomes free, rather than waiting
-        for an entire chunk to finish.
+        for an entire chunk to finish. Before dispatching a guest that will actually
+        be migrated, all cluster nodes are re-checked for availability so a node
+        that disappeared mid-run aborts the run instead of migrating guests onto a
+        stale target. Guests that would not be migrated anyway (already on their
+        target node, ignored, or of a type excluded from balancing) skip this check.
 
         Args:
             proxmox_api (ProxmoxApi): The Proxmox API client instance.
             proxlb_data (ProxLbData): ProxLB load balancing data.
+            guest_names (list, optional): Restrict the run to these guests (used to
+                execute storage-driven migrations when resource balancing is off).
 
         Returns:
             bool: True if all migrations completed successfully, False otherwise.
+
+        Raises:
+            NodeUnavailableError: If a cluster node is no longer online.
         """
         logger.debug("Starting: balance.")
         parallel_job_limit = Balancing.get_parallel_job_limit(proxlb_data.meta.balancing)
@@ -124,11 +135,25 @@ class Balancing:
 
         logger.debug("Starting: Balancing loop for guests.")
         for guest_name, guest_meta in proxlb_data.guests.items():
+            if guest_names is not None and guest_name not in guest_names:
+                continue
             while len(jobs_to_wait) >= parallel_job_limit:
                 if Balancing._check_jobs_and_release(proxmox_api, proxlb_data, jobs_to_wait, max_retries):
                     error_occurred = True
                 if len(jobs_to_wait) >= parallel_job_limit:
                     time.sleep(5)
+
+            guest_will_move = (
+                guest_meta.node_current != guest_meta.node_target
+                and not guest_meta.ignore
+                and guest_meta.type in proxlb_data.meta.balancing.balance_types)
+
+            if guest_will_move and not Helper.check_nodes_available(proxmox_api, proxlb_data.nodes):
+                logger.critical(
+                    "Balancing: At least one cluster node is no longer online. "
+                    "Aborting the current balancing run.")
+                raise NodeUnavailableError(
+                    "At least one cluster node became unavailable during balancing.")
 
             job_id = Balancing._exec_rebalancing(proxmox_api, proxlb_data, guest_name)
             logger.debug(f"Balancing: job_id for {guest_name}: {job_id!r}, jobs_to_wait len: {len(jobs_to_wait)}")
@@ -294,7 +319,8 @@ class Balancing:
     @staticmethod
     def _resolve_target_storage(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData,
                                 target_node: str, content: str,
-                                required_bytes: int = 0) -> Optional[str]:
+                                required_bytes: int = 0,
+                                preferred: Optional[str] = None) -> Optional[str]:
         """
         Resolves a storage on the target node for guests living on node-local
         (non-shared) storage, whose source storage id may not exist on the target.
@@ -321,6 +347,8 @@ class Balancing:
                 'rootdir' for CTs).
             required_bytes (int): Provisioned disk size of the guest. When 0 the
                 capacity guard is skipped (size unknown).
+            preferred (str, optional): Storage chosen by the storage balancer for
+                this guest; handled like an explicit mapping entry.
 
         Returns:
             Optional[str]: The resolved target storage id, or None.
@@ -333,7 +361,9 @@ class Balancing:
         guard = required_bytes > 0 and bool(
             getattr(balancing, "target_storage_capacity_guard", True))
 
-        storage_map = balancing.target_storage_map or {}
+        storage_map = dict(balancing.target_storage_map or {})
+        if preferred:
+            storage_map[target_node] = preferred
         if target_node in storage_map:
             mapped = storage_map[target_node]
             if guard:
@@ -446,7 +476,8 @@ class Balancing:
         required_bytes = int(proxlb_data.guests[guest_name].disk.total or 0)
         try:
             target_storage = Balancing._resolve_target_storage(
-                proxmox_api, proxlb_data, guest_node_target, "images", required_bytes)
+                proxmox_api, proxlb_data, guest_node_target, "images", required_bytes,
+                preferred=proxlb_data.guests[guest_name].target_storage)
         except InsufficientTargetStorageError as storage_error:
             logger.warning(
                 f"Balancing: Skipping migration of VM guest {guest_name} to "
@@ -507,7 +538,8 @@ class Balancing:
         required_bytes = int(proxlb_data.guests[guest_name].disk.total or 0)
         try:
             target_storage = Balancing._resolve_target_storage(
-                proxmox_api, proxlb_data, guest_node_target, "rootdir", required_bytes)
+                proxmox_api, proxlb_data, guest_node_target, "rootdir", required_bytes,
+                preferred=proxlb_data.guests[guest_name].target_storage)
         except InsufficientTargetStorageError as storage_error:
             logger.warning(
                 f"Balancing: Skipping migration of CT guest {guest_name} to "

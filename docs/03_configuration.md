@@ -25,6 +25,7 @@
         2. [Assigned Resources](#assigned-resources)
         3. [Pressure (PSI) based Resources](#pressure-psi-based-resources)
     11. [HA-Mode (ProxLB)](#ha-mode)
+    12. [Storage Balancing & I/O Error Recovery](#storage-balancing--io-error-recovery)
 
 ## Authentication / User Accounts / Permissions
 ### Authentication
@@ -310,6 +311,17 @@ balancing:
   mode: used
 ```
 
+#### Ignore ZFS ARC Memory
+On nodes with ZFS, Proxmox VE reports the ZFS ARC as used memory, although ZFS shrinks the ARC again as soon as the memory is needed. A growing or shrinking ARC on a single node can therefore trigger migrations while the guests did not change at all. When `ignore_zfs_arc` is enabled, ProxLB subtracts the ARC size from the used memory of each node before balancing.
+
+```yaml
+balancing:
+  mode: used
+  ignore_zfs_arc: True
+```
+
+The ARC size is read from the rrd data of the node, which only contains it on PVE 9 and newer. On older nodes the option has no effect, so in mixed clusters these nodes still count their ARC as used memory. ProxLB uses the latest rrd entry holding a value, so the value can be about a minute old. Keep in mind that ZFS does not shrink the ARC below `zfs_arc_min`. The option is disabled by default.
+
 ### 10.2 Assigned Resources
 When **mode: `assigned`** is configured, ProxLB evaluates the *provisioned or allocated resources* of each guest (VM or CT) instead of their runtime usage.
 It uses data such as **CPU cores**, **memory limits**, and **disk allocations** defined in Proxmox to calculate how much of each node’s capacity is reserved.
@@ -413,4 +425,52 @@ Make sure to enable the HA mode on all instances to avoid parallel evaluations o
 ```yaml
 service:
   enable_ha: true
+```
+
+### 12. Storage Balancing & I/O Error Recovery
+ProxLB can watch the fill level of every storage (node-local and shared) and fix full or soon-full storages before guests hit I/O errors.
+
+#### Detection
+For every active storage ProxLB reads its usage and the RRD history of the last `forecast_timeframe` and computes a linear growth trend. A storage is:
+
+* `critical` when its usage is at or above `critical_percent`,
+* `forecast` when the trend reaches `critical_percent` within `forecast_days`,
+* `warning` when its usage is at or above `warning_percent`.
+
+A quick overview, worst storage first, is printed by:
+```
+proxlb -c /etc/proxlb/proxlb.yaml --storage-report
+```
+
+#### Relief (critical and forecast storages)
+ProxLB escalates from the least to the most disruptive action and stops as soon as the storage is back under `target_max_percent` (including the growth expected over `forecast_days`):
+
+1. **fstrim** through the QEMU guest agent in VMs having `discard=on` disks on the storage (thin storages only: lvmthin, zfs, ceph, qcow2 on directories...). Space freed inside the guest is handed back to the pool without moving any data. Storage usage is re-read afterwards.
+2. **Disk move** (VMs only) of the smallest disk that frees enough space (or else the biggest ones) to another storage of the same node, live (`move_disk`). Proxmox cannot move the volume of a running container.
+3. **Migration** of the guest to another node with enough free memory, together with its local disks onto the local storage of that node with the most headroom. Pinning, affinity and anti-affinity are honored and only guest types listed in `balancing.balance_types` are migrated. Shared storages are never relieved by migrations, since the disks would stay on them.
+
+Every destination must stay below `target_max_percent` after the move and below `critical_percent` over the forecast horizon, and all planned moves are accounted for, so several moves never overcommit the same destination. Guests holding a lock (backup, snapshot, migration...) are skipped. Detached (`unusedN`) disks are listed by `--storage-report` but never deleted automatically.
+
+#### I/O error recovery
+When a storage fills up, QEMU pauses the affected VMs with the `io-error` status. With `io_error_recovery.enable`, a lightweight watchdog checks all running VMs every `interval` seconds between two balancing runs and after each run:
+
+* if one of the VM's storages still has less free space than `max(min_free_percent, min_free_gib)`, the VM is **not** resumed (it would fail again immediately): ProxLB runs fstrim on the VMs of that storage and starts a balancing run right away to move disks / migrate guests;
+* once there is room again, the VM is resumed (`status/resume`);
+* VMs holding a lock are never touched, and a VM is given up after `max_resume_attempts` resumes within one hour (logged as critical).
+
+#### Required permissions
+In addition to the permissions listed above, the storage balancer and the watchdog need `VM.Config.Disk` and `Datastore.AllocateSpace` (disk moves), `VM.PowerMgmt` (resume) and, for fstrim, `VM.Monitor` (PVE 8) or the guest agent file system permission `VM.GuestAgent.FileSystemMgmt` / `VM.GuestAgent.Unrestricted` (PVE 9).
+
+#### Example Configuration
+```yaml
+storage_balancing:
+  enable: True
+  critical_percent: 90
+  target_max_percent: 75
+  forecast_days: 7
+io_error_recovery:
+  enable: True
+  interval: 60
+balancing:
+  balance_types: ['vm', 'ct']
 ```

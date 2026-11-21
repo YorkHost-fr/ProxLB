@@ -21,12 +21,16 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
-import time
-from typing import Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from proxlb.utils.config_parser import Config
+from proxlb.utils.helper import Helper
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
 from proxlb.utils.proxmox_api import ProxmoxApi
+from proxlb.utils.rrd import NodeRrdKey, RrdDatasets
+
+if TYPE_CHECKING:
+    from proxlb.utils.rrd import NodeRrdDatasets
 
 BalancingResource = Config.Balancing.Resource
 
@@ -62,77 +66,104 @@ class Nodes:
         logger.debug("Starting: get_nodes.")
         nodes: dict[str, ProxLbData.Node] = {}
 
-        for node in proxmox_api.nodes.get():
-            # Ignoring a node results into ignoring all placed guests on the ignored node!
-            if node["status"] == "online" and not Nodes.set_node_ignore(proxlb_config, node["node"]):
+        # Ignoring a node results into ignoring all placed guests on the ignored node!
+        online_nodes = [
+            node for node in proxmox_api.nodes.get()
+            if node["status"] == "online" and not Nodes.set_node_ignore(proxlb_config, node["node"])
+        ]
 
-                cpu_used = node["cpu"] * node["maxcpu"]
-                # node["cpu"] is a utilization fraction (0.0–1.0)
-                cpu_free = (node["maxcpu"]) - (node["cpu"] * node["maxcpu"])
-                disk_free = node["maxdisk"] - node["disk"]
-                disk_used = node["disk"]
-                memory_used = node["mem"]
-                memory_free = node["maxmem"] - node["mem"]
+        # The HA status is cluster wide: fetch it once instead of once per node.
+        try:
+            ha_status: Optional[list[Any]] = list(proxmox_api.cluster.ha.status.current.get())
+        except Exception as exc:
+            logger.warning(f"Could not retrieve HA status: {exc}")
+            ha_status = []
 
-                nodes[node["node"]] = ProxLbData.Node(
-                    name=node["node"],
-                    pve_version=Nodes.get_node_pve_version(proxmox_api, node["node"]),
+        # Per node: version + RRD (AVERAGE, MAX). Nodes are queried concurrently.
+        def fetch(node_name: str) -> tuple[str, 'NodeRrdDatasets']:
+            return (
+                Nodes.get_node_pve_version(proxmox_api, node_name),
+                Nodes.get_node_rrd_datasets(proxmox_api, node_name),
+            )
+
+        fetched = Helper.parallel_map(
+            fetch, [node["node"] for node in online_nodes], proxlb_config.proxmox_api.parallel_requests)
+
+        for node, (pve_version, node_rrd) in zip(online_nodes, fetched):
+            cpu_used = node["cpu"] * node["maxcpu"]
+            # node["cpu"] is a utilization fraction (0.0–1.0)
+            cpu_free = (node["maxcpu"]) - (node["cpu"] * node["maxcpu"])
+            disk_free = node["maxdisk"] - node["disk"]
+            disk_used = node["disk"]
+            memory_used = node["mem"]
+            memory_free = node["maxmem"] - node["mem"]
+
+            # The ZFS ARC is reported as used memory by PVE, but ZFS frees it when the memory is needed
+            if proxlb_config.balancing.ignore_zfs_arc:
+                memory_zfs_arc = Nodes.get_node_zfs_arc_size(node_rrd, node["node"])
+                memory_used = memory_used - memory_zfs_arc
+                memory_free = memory_free + memory_zfs_arc
+
+            nodes[node["node"]] = ProxLbData.Node(
+                name=node["node"],
+                pve_version=pve_version,
+                pressure_hot=False,
+                maintenance=False,
+                cpu=ProxLbData.Node.Metric(
+                    total=node["maxcpu"],
+                    assigned=0,
+                    used=cpu_used,
+                    free=cpu_free,
+                    assigned_percent=0,
+                    free_percent=cpu_free / node["maxcpu"] * 100,
+                    used_percent=cpu_used / node["maxcpu"] * 100,
+                    pressure_some_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurecpusome"),
+                    pressure_full_percent=0.0,  # There is no pressure_full for nodes, only for guests
+                    pressure_some_spikes_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurecpusome", spikes=True),
+                    pressure_full_spikes_percent=0.0,
                     pressure_hot=False,
-                    maintenance=False,
-                    cpu=ProxLbData.Node.Metric(
-                        total=node["maxcpu"],
-                        assigned=0,
-                        used=cpu_used,
-                        free=cpu_free,
-                        assigned_percent=0,
-                        free_percent=cpu_free / node["maxcpu"] * 100,
-                        used_percent=cpu_used / node["maxcpu"] * 100,
-                        pressure_some_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "cpu", "some"),
-                        pressure_full_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "cpu", "full"),
-                        pressure_some_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "cpu", "some", spikes=True),
-                        pressure_full_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "cpu", "full", spikes=True),
-                        pressure_hot=False,
-                    ),
-                    disk=ProxLbData.Node.Metric(
-                        total=node["maxdisk"],
-                        assigned=0,
-                        used=node["disk"],
-                        free=disk_free,
-                        assigned_percent=0,
-                        free_percent=disk_free / node["maxdisk"] * 100,
-                        used_percent=disk_used / node["maxdisk"] * 100,
-                        pressure_some_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "disk", "some"),
-                        pressure_full_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "disk", "full"),
-                        pressure_some_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "disk", "some", spikes=True),
-                        pressure_full_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "disk", "full", spikes=True),
-                        pressure_hot=False,
-                    ),
-                    memory=ProxLbData.Node.Metric(
-                        total=Nodes.set_node_resource_reservation(node["node"], node["maxmem"], proxlb_config, BalancingResource.Memory),
-                        assigned=0,
-                        used=memory_used,
-                        free=memory_free,
-                        assigned_percent=0,
-                        free_percent=memory_free / node["maxmem"] * 100,
-                        used_percent=memory_used / node["maxmem"] * 100,
-                        pressure_some_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "memory", "some"),
-                        pressure_full_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "memory", "full"),
-                        pressure_some_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "memory", "some", spikes=True),
-                        pressure_full_spikes_percent=Nodes.get_node_rrd_data(proxmox_api, node["node"], "memory", "full", spikes=True),
-                        pressure_hot=False,
-                    ),
-                )
+                ),
+                disk=ProxLbData.Node.Metric(
+                    total=node["maxdisk"],
+                    assigned=0,
+                    used=node["disk"],
+                    free=disk_free,
+                    assigned_percent=0,
+                    free_percent=disk_free / node["maxdisk"] * 100,
+                    used_percent=disk_used / node["maxdisk"] * 100,
+                    pressure_some_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressureiosome"),
+                    pressure_full_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressureiofull"),
+                    pressure_some_spikes_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressureiosome", spikes=True),
+                    pressure_full_spikes_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressureiofull", spikes=True),
+                    pressure_hot=False,
+                ),
+                memory=ProxLbData.Node.Metric(
+                    total=Nodes.set_node_resource_reservation(node["node"], node["maxmem"], proxlb_config, BalancingResource.Memory),
+                    assigned=0,
+                    used=memory_used,
+                    free=memory_free,
+                    assigned_percent=0,
+                    free_percent=memory_free / node["maxmem"] * 100,
+                    used_percent=memory_used / node["maxmem"] * 100,
+                    pressure_some_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurememorysome"),
+                    pressure_full_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurememoryfull"),
+                    pressure_some_spikes_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurememorysome", spikes=True),
+                    pressure_full_spikes_percent=Nodes.get_node_rrd_value(node_rrd, node["node"], "pressurememoryfull", spikes=True),
+                    pressure_hot=False,
+                ),
+            )
 
-                # Evaluate if node should be set to maintenance mode
-                if Nodes.set_node_maintenance(proxmox_api, proxlb_config, node["node"]):
-                    nodes[node["node"]].maintenance = True
+            # Evaluate if node should be set to maintenance mode
+            if Nodes.set_node_maintenance(proxmox_api, proxlb_config, node["node"], ha_status):
+                nodes[node["node"]].maintenance = True
 
         logger.debug(f"Node metrics collected: {nodes}")
         logger.debug("Finished: get_nodes.")
         return nodes
 
     @staticmethod
-    def set_node_maintenance(proxmox_api: ProxmoxApi, proxlb_config: Config, node_name: str) -> bool:
+    def set_node_maintenance(proxmox_api: ProxmoxApi, proxlb_config: Config, node_name: str,
+                             ha_status: Optional[list[Any]] = None) -> bool:
         """
         Set nodes to maintenance mode based on the provided configuration.
 
@@ -143,6 +174,7 @@ class Nodes:
             proxmox_api (any): The Proxmox API client instance.
             proxlb_config (Dict[str, Any]): A dictionary containing the ProxLB configuration, including maintenance nodes.
             node_name: (str): The current node name within the outer iteration.
+            ha_status (list, optional): Pre-fetched cluster HA status (fetched when omitted).
 
         Returns:
             Bool: Returns a bool if the provided node name is present in the maintenance section of the config file.
@@ -157,9 +189,11 @@ class Nodes:
             logger.debug(f"Node: {node_name} is not in maintenance mode by ProxLB config.")
 
         # Evaluate maintenance mode by Proxmox HA
-        for ha_element in proxmox_api.cluster.ha.status.current.get():
+        if ha_status is None:
+            ha_status = list(proxmox_api.cluster.ha.status.current.get())
+        for ha_element in ha_status:
             if ha_element.get("status"):
-                if "maintenance mode" in ha_element.get("status"):
+                if "maintenance mode" in str(ha_element.get("status")):
                     if ha_element.get("node") == node_name:
                         logger.info(f"Node: {node_name} has been set to maintenance mode (by Proxmox HA API).")
                         return True
@@ -196,52 +230,108 @@ class Nodes:
         return False
 
     @staticmethod
-    def get_node_rrd_data(proxmox_api: ProxmoxApi, node_name: str, object_name: str, object_type: str, spikes: bool = False) -> float:
+    def get_node_rrd_datasets(proxmox_api: ProxmoxApi, node_name: str) -> 'NodeRrdDatasets':
         """
-        Retrieves the rrd data metrics for a specific resource (CPU, memory, disk) of a node.
+        Fetches the RRD data for a node once, covering both the average and maximum
+        (spike) consolidation functions.
+
+        A single Proxmox RRD response already contains every metric (cpu, memory, disk
+        usage as well as all of their pressure figures) for the requested timeframe.
+        Fetching it once per consolidation function (AVERAGE/MAX) and deriving all
+        individual values from it via get_node_rrd_value() avoids querying the same
+        endpoint repeatedly (previously up to 12 times per node).
 
         Args:
-            proxmox_api (Any): The Proxmox API client instance.
-            node_name (str): The name of the node hosting the guest.
-            object_name (str): The resource type to query (e.g., 'cpu', 'memory', 'disk').
-            object_type (str, optional): The pressure type ('some', 'full') or None for average usage.
+            proxmox_api (ProxmoxApi): The Proxmox API client instance.
+            node_name (str): The name of the node.
+
+        Returns:
+            NodeRrdDatasets: The average and maximum RRD data entries for the node.
+        """
+        logger.debug("Starting: get_node_rrd_datasets.")
+
+        try:
+            logger.debug(f"Getting average RRD data from node: {node_name}.")
+            rrd_average = proxmox_api.nodes(node_name).rrddata.get(timeframe="hour", cf="AVERAGE")
+        except Exception:
+            logger.error(f"Failed to retrieve AVERAGE RRD data for node: {node_name}. Using 0.0 as value.")
+            rrd_average = []
+
+        try:
+            logger.debug(f"Getting spike RRD data from node: {node_name}.")
+            rrd_max = proxmox_api.nodes(node_name).rrddata.get(timeframe="hour", cf="MAX")
+        except Exception:
+            logger.error(f"Failed to retrieve MAX RRD data for node: {node_name}. Using 0.0 as value.")
+            rrd_max = []
+
+        logger.debug("Finished: get_node_rrd_datasets.")
+        return RrdDatasets(average=rrd_average, maximum=rrd_max)
+
+    @staticmethod
+    def get_node_rrd_value(rrd_datasets: 'NodeRrdDatasets', node_name: str, rrd_key: NodeRrdKey, spikes: bool = False) -> float:
+        """
+        Derives a single rrd data metric (CPU, memory, disk pressure) of a node from the
+        datasets already fetched via get_node_rrd_datasets(). This performs no API call
+        itself.
+
+        Args:
+            rrd_datasets (NodeRrdDatasets): The RRD entries fetched for both consolidation functions.
+            node_name (str): The name of the node.
+            rrd_key (NodeRrdKey): The rrd field to read.
             spikes (bool, optional): Whether to consider spikes in the calculation. Defaults to False.
 
         Returns:
             float: The calculated average usage value for the specified resource.
         """
-        logger.debug("Starting: get_node_rrd_data.")
-        time.sleep(0.1)
+        logger.debug("Starting: get_node_rrd_value.")
+        node_data_rrd = rrd_datasets.maximum if spikes else rrd_datasets.average
 
-        try:
-            if spikes:
-                logger.debug(f"Getting spike RRD data for {object_name} from node: {node_name}.")
-                node_data_rrd = proxmox_api.nodes(node_name).rrddata.get(timeframe="hour", cf="MAX")
-            else:
-                logger.debug(f"Getting average RRD data for {object_name} from node: {node_name}.")
-                node_data_rrd = proxmox_api.nodes(node_name).rrddata.get(timeframe="hour", cf="AVERAGE")
-
-        except Exception:
-            logger.error(f"Failed to retrieve RRD data for guest: {node_name}. Using 0.0 as value.")
-            logger.debug("Finished: get_node_rrd_data.")
+        if not node_data_rrd:
+            logger.debug("Finished: get_node_rrd_value.")
             return 0.0
-
-        lookup_key = f"pressure{object_name}{object_type}"
 
         if spikes:
             # RRD data is collected every minute, so we look at the last 6 entries
             # and take the maximum value to represent the spike
             rrd_data_value = max(
-                [row.get(lookup_key) for row in node_data_rrd if row.get(lookup_key) is not None][-6:],
+                [row[rrd_key] for row in node_data_rrd if rrd_key in row and row[rrd_key] is not None][-6:],  # pyright: ignore[reportTypedDictNotRequiredAccess]
                 default=0.0,
             )
         else:
             # Calculate the average value from the RRD data entries
-            rrd_data_value = sum(entry.get(lookup_key, 0.0) for entry in node_data_rrd) / len(node_data_rrd)
+            rrd_data_value = sum(entry[rrd_key] for entry in node_data_rrd if rrd_key in entry and entry[rrd_key] is not None) / len(node_data_rrd)  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
-        logger.debug(f"RRD data (spike: {spikes}) for {object_name} from node: {node_name}: {rrd_data_value}")
-        logger.debug("Finished: get_node_rrd_data.")
+        logger.debug(f"RRD data (spike: {spikes}) for {rrd_key} from node: {node_name}: {rrd_data_value}")
+        logger.debug("Finished: get_node_rrd_value.")
         return rrd_data_value
+
+    @staticmethod
+    def get_node_zfs_arc_size(rrd_datasets: 'NodeRrdDatasets', node_name: str) -> float:
+        """
+        Gets the ZFS ARC size of a node from the datasets already fetched via get_node_rrd_datasets(). This performs no API call itself.
+
+        The ARC size is only part of the node rrd data on PVE >= 9. The rrd data does not provide live values, so the latest entry holding a value is used.
+
+        Args:
+            rrd_datasets (NodeRrdDatasets): The RRD entries fetched for both consolidation functions.
+            node_name (str): The name of the node.
+
+        Returns:
+            float: The ZFS ARC size in bytes or 0.0 if the node does not provide it.
+        """
+        logger.debug("Starting: get_node_zfs_arc_size.")
+
+        # The newest rrd entries are not always populated yet
+        for entry in reversed(rrd_datasets.average):
+            zfs_arc_size = entry.get("arcsize")
+            if zfs_arc_size is not None:
+                logger.debug(f"ZFS ARC size from node: {node_name}: {zfs_arc_size}")
+                logger.debug("Finished: get_node_zfs_arc_size.")
+                return zfs_arc_size
+
+        logger.warning(f"No ZFS ARC size found in RRD data for node: {node_name} (requires PVE >= 9). Using 0.0 as value.")
+        logger.debug("Finished: get_node_zfs_arc_size.")
+        return 0.0
 
     @staticmethod
     def get_node_pve_version(proxmox_api: ProxmoxApi, node_name: str) -> str:
@@ -264,7 +354,6 @@ class Nodes:
                     handle or propagate exceptions as appropriate.
         """
         logger.debug("Starting: get_node_pve_version.")
-        time.sleep(0.1)
 
         try:
             logger.debug(f"Trying to get PVE version for node: {node_name}.")

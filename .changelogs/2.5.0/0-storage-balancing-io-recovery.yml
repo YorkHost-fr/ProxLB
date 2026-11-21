@@ -1,0 +1,6 @@
+added:
+- Add storage aware balancing - detect full / forecast-full storages and relieve them with fstrim, live disk moves or guest migrations (@yorkhost-fr). [#0]
+- Add I/O error recovery watchdog - free space first, then resume VMs paused by io-error (@yorkhost-fr). [#0]
+- Add '--storage-report' CLI option printing storage fill levels and forecast (@yorkhost-fr). [#0]
+changed:
+- Collect node, guest and storage metrics concurrently (parallel_requests) and without per-request sleeps (@yorkhost-fr). [#0]

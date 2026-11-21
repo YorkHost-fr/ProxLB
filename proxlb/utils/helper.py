@@ -14,17 +14,34 @@ import re
 import socket
 import sys
 import time
+import proxmoxer
+import requests
 from datetime import datetime, timedelta, time as datetime_time
 from proxlb.utils import version
 from proxlb.utils.config_parser import Config
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
-from typing import Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, Iterable, Tuple, Optional, TypeVar, TYPE_CHECKING
 from types import FrameType
+
+if TYPE_CHECKING:
+    from proxlb.utils.proxmox_api import ProxmoxApi
 
 BalancingResource = Config.Balancing.Resource
 
 logger = SystemdLogger()
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+class NodeUnavailableError(Exception):
+    """
+    Raised when a node that was previously discovered via Nodes.get_nodes()
+    is no longer online in the cluster, indicating the ProxLB run should be
+    aborted and restarted from scratch.
+    """
 
 
 class Helper:
@@ -128,12 +145,34 @@ class Helper:
             sys.exit(0)
 
     @staticmethod
-    def get_daemon_mode(proxlb_config: Config) -> None:
+    def parallel_map(func: Callable[[_T], _R], items: Iterable[_T], workers: int) -> list[_R]:
+        """
+        Apply `func` to every item using a bounded thread pool and return the
+        results in input order. API calls are I/O bound, so threads give a near
+        linear speed-up up to the number of workers. With workers <= 1 the
+        items are processed sequentially. Exceptions raised by `func` are
+        propagated to the caller.
+        """
+        items = list(items)
+        if workers <= 1 or len(items) <= 1:
+            return [func(item) for item in items]
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as executor:
+            return list(executor.map(func, items))
+
+    @staticmethod
+    def get_daemon_mode(proxlb_config: Config, watchdog: Optional[Callable[[], bool]] = None) -> None:
         """
         Checks if the daemon mode is active and handles the scheduling accordingly.
 
+        When a `watchdog` callback is given and I/O-error recovery is enabled,
+        the wait until the next balancing run is split into intervals of
+        io_error_recovery.interval seconds and the watchdog runs after each one.
+        When the watchdog returns True the wait ends early so the next
+        balancing run starts immediately (e.g. a storage became full).
+
         Parameters:
             proxlb_config (Dict[str, Any]): A dictionary containing the ProxLB configuration.
+            watchdog (Callable, optional): Lightweight check executed between runs.
 
         Returns:
             None
@@ -142,7 +181,22 @@ class Helper:
         if proxlb_config.service.daemon:
 
             logger.info(f"Daemon mode active: Next run in: {proxlb_config.service.schedule}.")
-            time.sleep(proxlb_config.service.schedule.seconds)
+            remaining = proxlb_config.service.schedule.seconds
+            if watchdog is not None and proxlb_config.io_error_recovery.enable:
+                interval = proxlb_config.io_error_recovery.interval
+                while remaining > 0 and not Helper.proxlb_reload:
+                    step = min(interval, remaining)
+                    time.sleep(step)
+                    remaining -= step
+                    if remaining > 0:
+                        try:
+                            if watchdog():
+                                logger.warning("Watchdog requested an immediate run.")
+                                break
+                        except Exception as exc:
+                            logger.error(f"Watchdog run failed: {exc}")
+            else:
+                time.sleep(remaining)
 
         else:
             logger.debug("Successfully executed ProxLB. Daemon mode not active - stopping.")
@@ -357,7 +411,7 @@ class Helper:
                 return host_object, 8006
 
     @staticmethod
-    def validate_node_presence(node: str, nodes: Dict[str, ProxLbData.Node]) -> bool:
+    def validate_node_presence(node: str, nodes: Dict[str, ProxLbData.Node]) -> Optional[str]:
         """
         Validates whether a given node exists in the provided cluster nodes dictionary.
 
@@ -367,18 +421,19 @@ class Helper:
                                     Must include a "nodes" key mapping to a dict of available nodes.
 
         Returns:
-            bool: True if the node exists in the cluster, False otherwise.
+            Optional[str]: Name of the node if matching.
         """
         logger.debug("Starting: validate_node_presence.")
 
-        if node in nodes.keys():
-            logger.info(f"Node {node} found in cluster. Applying pinning.")
-            logger.debug("Finished: validate_node_presence.")
-            return True
-        else:
-            logger.warning(f"Node {node} not found in cluster. Not applying pinning!")
-            logger.debug("Finished: validate_node_presence.")
-            return False
+        for _node in nodes:
+            if node.lower() == _node.lower():
+                logger.info(f"Node {node} found in cluster. Applying pinning.")
+                logger.debug("Finished: validate_node_presence.")
+                return _node
+
+        logger.warning(f"Node {node} not found in cluster. Not applying pinning!")
+        logger.debug("Finished: validate_node_presence.")
+        return None
 
     @staticmethod
     def tcp_connect_test(addr_family: int, host: str, port: int, timeout: int) -> tuple[bool, Optional[int]]:
@@ -404,3 +459,49 @@ class Helper:
             return (rc == 0, rc if rc != 0 else None)
         finally:
             test_socket.close()
+
+    @staticmethod
+    def check_nodes_available(proxmox_api: "ProxmoxApi", nodes: Dict[str, ProxLbData.Node]) -> bool:
+        """
+        Validates that a balancing decision made at the start of a run is still
+        useful by checking that all previously discovered cluster nodes are still
+        online, via a single call to the cluster status endpoint (cluster/status).
+
+        API connection reachability itself is already handled by ProxmoxApi and
+        is not what this check is for.
+
+        Args:
+            proxmox_api (ProxmoxApi): The Proxmox API client instance.
+            nodes (Dict[str, ProxLbData.Node]): The nodes collected at the start of the run.
+
+        Returns:
+            bool: True if every previously discovered node is still online, False otherwise.
+        """
+        logger.debug("Starting: check_nodes_available.")
+
+        if not nodes:
+            logger.debug("Finished: check_nodes_available.")
+            return True
+
+        try:
+            cluster_status = proxmox_api.cluster.status.get()
+        except (proxmoxer.core.ResourceException, requests.exceptions.RequestException) as cluster_error:
+            logger.warning(f"Helper: Failed to query cluster status: {cluster_error}")
+            logger.debug("Finished: check_nodes_available.")
+            return False
+
+        online_nodes = {
+            entry["name"] for entry in cluster_status
+            if entry.get("type") == "node" and entry.get("online")
+        }
+
+        for node_name in nodes:
+            if node_name not in online_nodes:
+                logger.warning(
+                    f"Helper: Node {node_name} is no longer online in the cluster "
+                    "and may no longer be available.")
+                logger.debug("Finished: check_nodes_available.")
+                return False
+
+        logger.debug("Finished: check_nodes_available.")
+        return True

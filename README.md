@@ -284,6 +284,7 @@ solver:
   timeout_seconds: 30
   use_reservations: True
   active_step_retries: 3
+  fallback_to_greedy: True
 ```
 
 See [docs/04_solver.md](docs/04_solver.md) for the full configuration reference, a description of the feedback loop in active mode, and instructions for generating HTML reports.
@@ -317,6 +318,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | timeout |  | 10 | `Int` | Timeout for the Proxmox API in sec. |
 |  | retries |  | 1 | `Int` | How often a connection attempt to the defined API host should be performed. |
 |  | wait_time |  | 1 | `Int` | How many seconds should be waited before performing another connection attempt to the API host. |
+|  | parallel_requests |  | 8 | `Int` | Number of concurrent API requests while collecting node, guest and storage metrics. `1` restores sequential collection. |
 | `proxmox_cluster` |  |  |  |  |  |
 |  | maintenance_nodes |  | ['virt66.example.com'] | `List` | A list of Proxmox nodes that are defined to be in a maintenance. (must be the same node names as used within the cluster) |
 |  | maintenance_nodes_schedule |  |  | `Dict` | A weekly schedule that temporarily adds nodes to `maintenance_nodes` during runtime. |
@@ -344,9 +346,35 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | method |  | memory | `Str` | The balancing method that should be used. The greedy balancer supports `memory` (default), `cpu`, `disk`. With the CP-SAT solver enabled (`solver.enable: True`), the multi-resource and pressure-aware methods are also available: `global_smart` (co-optimises memory+cpu+disk), `memory_smart` / `cpu_smart` / `io_smart` (usage blended with PSI pressure), and `memory_psi` / `cpu_psi` / `io_psi` (pressure only). Solver-only methods require the solver to be enabled.|
 |  | mode |  | used | `Str` | The balancing mode that should be used. [values: `used` (default), `assigned`, `psi` (pressure)] |
 |  | balance_larger_guests_first |  | False | `Bool` | Option to prefer larger/smaller guests first |
+|  | ignore_zfs_arc |  | False | `Bool` | Do not count the ZFS ARC as used memory of a node. Requires PVE >= 9. |
 |  | node_resource_reserve |  | { default: { memory: 4 }, { node01: { memory: 6 }} } | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
+| `storage_balancing` |  |  |  |  |  |
+|  | enable |  | False | `Bool` | Detect full / soon-full storages and relieve them (fstrim, disk move, migration). See [Storage Balancing](docs/03_configuration.md#storage-balancing--io-error-recovery). |
+|  | warning_percent |  | 80 | `Float` | Fill level from which a storage is reported. |
+|  | critical_percent |  | 90 | `Float` | Fill level from which a storage is considered full and relieved. |
+|  | target_max_percent |  | 75 | `Float` | Fill level aimed for on a relieved storage and maximum fill level accepted on a destination storage. Must be lower than `critical_percent`. |
+|  | forecast |  | True | `Bool` | Also relieve storages forecast (linear trend of the RRD history) to reach `critical_percent` within `forecast_days`. |
+|  | forecast_days |  | 7 | `Float` | Forecast horizon in days. |
+|  | forecast_timeframe |  | week | `Str` | RRD history used for the trend. [values: `hour`, `day`, `week` (default), `month`, `year`] |
+|  | strategy |  | disk_move_first | `Str` | Order of the relief steps after fstrim. [values: `disk_move_first` (default), `migrate_first`] |
+|  | allow_disk_move |  | True | `Bool` | Allow live moves of VM disks to another storage of the same node. |
+|  | allow_node_migration |  | True | `Bool` | Allow migrating a guest (with its local disks) to another node. Honors `balancing.balance_types`, pinning and (anti-)affinity. |
+|  | fstrim |  | True | `Bool` | Run fstrim through the QEMU guest agent first, for VMs with `discard=on` disks on a full thin storage. |
+|  | delete_source |  | True | `Bool` | Delete the source volume after a successful disk move. |
+|  | max_actions_per_run |  | 5 | `Int` | Maximum number of disk moves / migrations planned per run. |
+|  | parallel_moves |  | 1 | `Int` | Number of concurrent disk moves (never two on the same VM). |
+|  | max_move_time |  | 7200 | `Int` | Seconds after which a disk move is reported as timed out. |
+|  | bwlimit |  |  | `Int` | Optional bandwidth limit for disk moves in KiB/s. |
+|  | exclude_storages |  | [] | `List` | Storage ids never touched by the storage balancer. |
+| `io_error_recovery` |  |  |  |  |  |
+|  | enable |  | False | `Bool` | Watchdog recovering VMs paused by an I/O error: frees space first, resumes the VM only once its storages have room again. |
+|  | interval |  | 60 | `Int` | Seconds between two watchdog scans while waiting for the next balancing run (daemon mode). |
+|  | resume_paused |  | False | `Bool` | Also resume VMs in plain `paused` state (not only `io-error`). |
+|  | min_free_percent |  | 2 | `Float` | A VM is not resumed while one of its storages has less free space than `max(min_free_percent, min_free_gib)`. |
+|  | min_free_gib |  | 1 | `Float` | See `min_free_percent`. |
+|  | max_resume_attempts |  | 3 | `Int` | Maximum resumes per VM and hour before giving up and alerting. |
 | `service` |  |  |  |  |  |
 |  | daemon |  | True | `Bool` | If daemon mode should be activated. |
 |  | enable_ha |  | False | `Bool` | Enables HA mode of ProxLB. |
@@ -402,6 +430,7 @@ balancing:
   method: memory
   mode: used
   balance_larger_guests_first: False
+  ignore_zfs_arc: False
   node_resource_reserve:
     defaults:
       memory: 4
@@ -531,16 +560,28 @@ balancing:
 ### Ignore VMs
 <img align="left" src="https://cdn.gyptazy.com/img/proxlb-ignore-vm-movement.jpg"/> Guests, such as VMs or CTs, can also be completely ignored. This means, they won't be affected by any migration (even when (anti-)affinity rules are enforced). To ensure a proper resource evaluation, these guests are still collected and evaluated but simply skipped for balancing actions. Another thing is the implementation. While ProxLB might have a very restricted configuration file including the file permissions, this file is only read- and writeable by the Proxmox administrators. However, we might have user and groups who want to define on their own that their systems shouldn't be moved. Therefore, these users can simpy set a specific tag to the guest object - just like the (anti)affinity rules.
 
+**Note:** Ignored guests are really ignored. Even by enforcing affinity rules this guest will be ignored.
+
+#### Ignoring VMs via Tags
 To define a guest to be ignored from the balancing, users assign a tag with the prefix `plb_ignore_$TAG`:
 
-#### Example for Screenshot
+##### Example for Screenshot
 ```
 plb_ignore_dev
 ```
 
 As a result, ProxLB will not migrate this guest with the `plb_ignore_dev` tag to any other node.
 
-**Note:** Ignored guests are really ignored. Even by enforcing affinity rules this guest will be ignored.
+#### Ignoring VMs by Name via Configuration
+Guests can also be ignored by name directly in the ProxLB configuration file. This is useful for automatically provisioned VMs or CTs that cannot have tags assigned themselves.
+
+**Example Config**
+```yaml
+balancing:
+  ignore_guests: ['my-auto-vm-01', 'my-auto-vm-02']
+```
+
+As a result, ProxLB will not migrate any guest whose name appears in the `ignore_guests` list.
 
 ### Pin VMs to Specific Hypervisor Nodes
 <img align="left" src="https://cdn.gyptazy.com/img/proxlb-tag-node-pinning.jpg"/> Guests, such as VMs or CTs, can also be pinned to specific (and multiple) nodes in the cluster. This might be usefull when running applications with some special licensing requirements that are only fulfilled on certain nodes. It might also be interesting, when some physical hardware is attached to a node, that is not available in general within the cluster.

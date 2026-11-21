@@ -28,6 +28,7 @@ class CliParser:
         - `-d` or `--dry-run`: Performs a dry-run without executing any actions.
         - `-j` or `--json`: Returns a JSON of the VM movement.
         - `-b` or `--best-node`: Returns the best next node.
+        - `-s` or `--storage-report`: Prints the storage fill levels / forecast and exits.
         - `-v` or `--version`: Returns the current ProxLB version.
 
         Logs the start and end of the initialization process.
@@ -62,6 +63,12 @@ class CliParser:
         self.parser.add_argument(
             "-b", "--best-node",
             help="Returns the best next node",
+            action="store_true",
+            required=False
+        )
+        self.parser.add_argument(
+            "-s", "--storage-report",
+            help="Print the fill level and forecast of all storages (worst first) and exit",
             action="store_true",
             required=False
         )

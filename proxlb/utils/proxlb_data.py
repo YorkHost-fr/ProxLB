@@ -61,6 +61,14 @@ class ProxLbData(BaseModel):
         maintenance: list[str] = []
 
     class Guest(BaseModel):
+        class Volume(BaseModel):
+            key: str                     # config key, e.g. scsi0, efidisk0, rootfs, mp0
+            storage: str                 # storage id
+            volid: str                   # full volume id, e.g. local-lvm:vm-100-disk-0
+            size: int = 0                # provisioned size in bytes
+            used: Optional[int] = None   # allocated bytes on the storage, when known
+            discard: bool = False        # 'discard=on' (fstrim can give space back)
+
         class Metric(BaseModel):
             total: int
             used: float
@@ -87,6 +95,13 @@ class ProxLbData(BaseModel):
         node_relationships: list[str]
         node_relationships_strict: bool
         type: GuestType
+        volumes: list[Volume] = []
+        unused_volumes: list[str] = []
+        agent: bool = False
+        lock: Optional[str] = None
+        # Storage selected for this guest by the storage balancer when it is
+        # migrated to another node (overrides target_storage_auto/map).
+        target_storage: Optional[str] = None
 
         def metric(self, name: BalancingResource) -> Metric:
             name = Config.Balancing.base_resource(name)
@@ -130,6 +145,38 @@ class ProxLbData(BaseModel):
                 return self.memory
             assert_never(name)
 
+    class Storage(BaseModel):
+        key: str                         # '<node>::<id>' or 'shared::<id>'
+        name: str                        # storage id
+        node: str                        # node used to query it
+        nodes: list[str] = []            # nodes on which it is available
+        type: str = ""
+        shared: bool = False
+        content: list[str] = []
+        total: int = 0
+        used: int = 0
+        avail: int = 0
+        used_percent: float = 0.0
+        growth_bytes_per_day: float = 0.0
+        projected_percent: float = 0.0
+        days_until_full: Optional[float] = None
+        days_until_critical: Optional[float] = None
+        status: str = "ok"               # ok | warning | forecast | critical
+
+    class StorageAction(BaseModel):
+        action: Literal["fstrim", "move_disk", "migrate"]
+        guest: str
+        guest_id: int
+        guest_type: GuestType
+        node: str
+        target_node: str
+        volume: str = ""
+        source_storage: str
+        target_storage: str = ""
+        size: int = 0
+        reason: str = ""
+        status: str = "planned"          # planned | done | failed | skipped
+
     class Pool(BaseModel):
         name: str
         members: list[str] = []
@@ -146,3 +193,5 @@ class ProxLbData(BaseModel):
     meta: Meta
     nodes: dict[str, Node]
     pools: dict[str, Pool]
+    storages: dict[str, Storage] = {}
+    storage_actions: list[StorageAction] = []

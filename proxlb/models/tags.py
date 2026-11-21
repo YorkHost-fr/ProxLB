@@ -10,8 +10,8 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
-import time
-from typing import Dict, List, assert_never
+import re
+from typing import Any, Dict, List, assert_never
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.helper import Helper
 from proxlb.utils.config_parser import Config
@@ -70,21 +70,28 @@ class Tags:
             List: A list of all tags assoiciated with the given guest.
         """
         logger.debug("Starting: get_tags_from_guests.")
-        time.sleep(0.1)
-        api_tags: str
         if guest_type == GuestType.Vm:
             guest_config = proxmox_api.nodes(node).qemu(guest_id).config.get()
-            api_tags = guest_config.get("tags", "")
         elif guest_type == GuestType.Ct:
             guest_config = proxmox_api.nodes(node).lxc(guest_id).config.get()
-            api_tags = guest_config.get("tags", "")
         else:
             assert_never(guest_type)
 
-        tags = api_tags.split(";") if isinstance(api_tags, str) else []
+        tags = Tags.parse_tags(dict(guest_config))
 
         logger.debug("Finished: get_tags_from_guests.")
         return tags
+
+    @staticmethod
+    def parse_tags(guest_config: Dict[str, Any]) -> List[str]:
+        """
+        Extract the tag list from an already fetched guest configuration.
+        Tags may be separated by commas, semicolons or whitespace.
+        """
+        api_tags = guest_config.get("tags", "")
+        if isinstance(api_tags, str) and api_tags.strip():
+            return [t for t in re.split(r"[,;\s]+", api_tags) if t]
+        return []
 
     @staticmethod
     def get_affinity_groups(tags: List[str], pools: List[str], ha_rules: List[ProxLbData.HaRule], proxlb_config: Config) -> List[str]:
@@ -187,15 +194,20 @@ class Tags:
         return anti_affinity_tags
 
     @staticmethod
-    def get_ignore(tags: List[str]) -> bool:
+    def get_ignore(tags: List[str], name: str, proxlb_config: Config) -> bool:
         """
-        Validate for ignore tags of a guest from the Proxmox cluster by the API.
+        Validate whether a guest should be ignored during balancing.
 
-        This method retrieves all tags for a given guest and evaluates the
-        ignore tag which are required during the balancing calculations.
+        This method checks both the guest's tags and the ProxLB configuration
+        to determine whether the guest should be excluded from balancing actions.
+        A guest is ignored if it carries a tag with the prefix `plb_ignore` or
+        if its name is listed in the `ignore_guests` option of the balancing
+        configuration.
 
         Args:
             tags (List): A list holding all defined tags for a given guest.
+            name (str):  The name of the guest VM or CT.
+            proxlb_config (Config): The ProxLB configuration object.
 
         Returns:
             Bool: Returns a bool that indicates whether to ignore a guest or not.
@@ -212,6 +224,10 @@ class Tags:
                     ignore_tag = True
                 else:
                     logger.debug(f"Tag: {tag} This is not an ignore tag.")
+
+        if not ignore_tag and name in proxlb_config.balancing.ignore_guests:
+            logger.debug(f"Guest {name} is listed in ignore_guests and will not be rebalanced.")
+            ignore_tag = True
 
         logger.debug("Finished: get_ignore.")
         return ignore_tag
@@ -246,10 +262,11 @@ class Tags:
                     node_relationship_tag = tag.replace("plb_pin_", "")
 
                     # Validate if the node to pin is present in the cluster
-                    if Helper.validate_node_presence(node_relationship_tag, nodes):
+                    _node_name = Helper.validate_node_presence(node_relationship_tag, nodes)
+                    if _node_name:
                         logger.debug(f"Tag {node_relationship_tag} is valid! Defined node exists in the cluster.")
-                        logger.debug(f"Setting node relationship because of tag {tag} to {node_relationship_tag}.")
-                        node_relationship_tags.append(node_relationship_tag)
+                        logger.debug(f"Setting node relationship because of tag {tag} to {_node_name}.")
+                        node_relationship_tags.append(_node_name)
                     else:
                         logger.warning(f"Tag {node_relationship_tag} is invalid! Defined node does not exist in the cluster. Not applying pinning.")
 
