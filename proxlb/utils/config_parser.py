@@ -8,6 +8,7 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
+import hashlib
 import os
 import sys
 try:
@@ -233,8 +234,19 @@ class Config(BaseModel):
             def __str__(self) -> str:
                 return f"{self.interval} {self.format}"
 
+        class Control(BaseModel):
+            """
+            Internal HTTP control endpoint (status JSON, run now, config
+            validation) used by the YorkHost ops panel. Every route except
+            /healthz requires 'Authorization: Bearer <PROXLB_CONTROL_TOKEN>'.
+            """
+            enable: bool = False
+            bind: str = "0.0.0.0"
+            port: int = Field(default=8080, ge=1, le=65535)
+
         daemon: bool = True
         enable_ha: bool = False
+        control: Control = Field(default_factory=Control)
         delay: Delay = Delay()
         log_level: "Config.Service.LogLevel" = LogLevel.INFO
         schedule: Schedule = Schedule()
@@ -408,6 +420,9 @@ class ConfigParser:
     # Environment variables overriding the Proxmox API credentials, so that
     # secrets can be injected (e.g. from a Kubernetes Secret) instead of
     # being written into the config file.
+    # Hash of the configuration file content last loaded (shown by the ops panel).
+    last_loaded_sha256: str = ""
+
     ENV_OVERRIDES = {
         "PROXLB_API_HOSTS": "hosts",
         "PROXLB_API_USER": "user",
@@ -417,12 +432,58 @@ class ConfigParser:
     }
 
     @staticmethod
+    def read_env_file(path: str) -> dict[str, str]:
+        """
+        Parse a dotenv file (KEY=value lines, '#' comments, optional 'export '
+        prefix and surrounding quotes), e.g. the .env written by a 1Password
+        init container. Returns an empty dict when the file cannot be read.
+        """
+        values: dict[str, str] = {}
+        try:
+            with open(path, encoding="utf-8") as env_file:
+                lines = env_file.read().splitlines()
+        except OSError as exc:
+            logger.warning(f"Could not read env file {path}: {exc}")
+            return values
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, value = line.split("=", 1)
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            values[key.strip()] = value
+        return values
+
+    @staticmethod
+    def environment(environ: Optional[dict[str, str]] = None) -> dict[str, str]:
+        """
+        Effective environment: variables from the file named by PROXLB_ENV_FILE
+        (if any), overridden by the real environment variables.
+        """
+        env = dict(os.environ if environ is None else environ)
+        env_file = env.get("PROXLB_ENV_FILE", "").strip()
+        if env_file:
+            merged = ConfigParser.read_env_file(env_file)
+            merged.update({k: v for k, v in env.items() if v != ""})
+            return merged
+        return env
+
+    @staticmethod
+    def getenv(name: str, default: str = "") -> str:
+        return ConfigParser.environment().get(name, default)
+
+    @staticmethod
     def apply_env_overrides(data: dict[str, Any], environ: Optional[dict[str, str]] = None) -> dict[str, Any]:
         """
-        Override proxmox_api settings from PROXLB_API_* environment variables.
-        PROXLB_API_HOSTS is a comma separated list. Empty variables are ignored.
+        Override proxmox_api settings from PROXLB_API_* environment variables
+        (or from the file named by PROXLB_ENV_FILE). PROXLB_API_HOSTS is a comma
+        separated list. Empty variables are ignored.
         """
-        env = os.environ if environ is None else environ
+        env = ConfigParser.environment(environ)
         api = dict(data.get("proxmox_api") or {})
         for variable, key in ConfigParser.ENV_OVERRIDES.items():
             value = env.get(variable, "").strip()
@@ -434,6 +495,35 @@ class ConfigParser:
             data["proxmox_api"] = api
         return data
 
+    @staticmethod
+    def validate_yaml(text: str) -> tuple[bool, list[str], list[str]]:
+        """
+        Validate a configuration given as YAML text, with the environment
+        overrides applied exactly as at startup. Returns (ok, errors, warnings).
+        """
+        warnings: list[str] = []
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            return False, [f"YAML invalide : {exc}"], warnings
+        if not isinstance(data, dict):
+            return False, ["La configuration doit être un dictionnaire YAML."], warnings
+        api = data.get("proxmox_api") or {}
+        if isinstance(api, dict):
+            for key in ("pass", "token_secret"):
+                if api.get(key):
+                    warnings.append(f"proxmox_api.{key} est en clair dans la configuration : "
+                                    "le mettre dans les secrets (PROXLB_API_*).")
+        try:
+            Config(**ConfigParser.apply_env_overrides(dict(data)))
+        except ValidationError as exc:
+            return False, [
+                f"{'.'.join(str(p) for p in err.get('loc', ()))}: {err.get('msg')}" for err in exc.errors()
+            ], warnings
+        except TypeError as exc:
+            return False, [str(exc)], warnings
+        return True, [], warnings
+
     def get_config(self) -> Config:
         """
         Parses and returns CLI arguments.
@@ -442,9 +532,11 @@ class ConfigParser:
         logger.info(f"Using config path: {self.config_path}")
 
         try:
-            with self.config_path.open(encoding="utf-8") as config_file:
-                data = yaml.load(config_file, Loader=yaml.FullLoader) or {}
-            return Config(**ConfigParser.apply_env_overrides(data))
+            raw = self.config_path.read_bytes()
+            data = yaml.load(raw, Loader=yaml.FullLoader) or {}
+            config = Config(**ConfigParser.apply_env_overrides(data))
+            ConfigParser.last_loaded_sha256 = hashlib.sha256(raw).hexdigest()
+            return config
         except yaml.YAMLError as exception_error:
             msg = f"Error loading YAML file: {exception_error}"
             print(msg)

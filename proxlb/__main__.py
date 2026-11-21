@@ -42,6 +42,7 @@ from proxlb.models.storages import Storages
 from proxlb.models.storage_balancing import StorageBalancing
 from proxlb.utils.helper import Helper, NodeUnavailableError
 from proxlb.utils.proxlb_data import ProxLbData
+from proxlb.utils.control import ControlServer, ControlState
 
 
 """
@@ -75,6 +76,55 @@ proxmox_api = ProxmoxApi(proxlb_config)
 # Overwrite password after creating the API object
 proxlb_config.proxmox_api.password = "********"
 proxlb_config.proxmox_api.token_secret = "********"
+
+# Internal control endpoint for the ops panel (status, run now, validation).
+if proxlb_config.service.control.enable and not cli_args.storage_report:
+    ControlServer.start(
+        proxlb_config.service.control.bind,
+        proxlb_config.service.control.port,
+        ConfigParser.getenv("PROXLB_CONTROL_TOKEN"),
+    )
+
+
+def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> None:
+    """
+    Publish the outcome of a balancing run on the control endpoint.
+    """
+    storages = Storages.sorted_storages(proxlb_data.storages) if proxlb_data.storages else []
+    ControlState.update(
+        config_sha256=ConfigParser.last_loaded_sha256,
+        dry_run=bool(cli_args.dry_run),
+        run={
+            "started_at": started,
+            "finished_at": time.time(),
+            "duration": round(time.time() - started, 1),
+            "error": error,
+            "balance_required": proxlb_data.meta.balancing.balance,
+        },
+        features={
+            "balancing": proxlb_config.balancing.enable,
+            "storage_balancing": proxlb_config.storage_balancing.enable,
+            "io_error_recovery": proxlb_config.io_error_recovery.enable,
+            "solver": proxlb_config.solver.enable,
+            "method": str(proxlb_config.balancing.method),
+            "mode": str(proxlb_config.balancing.mode),
+        },
+        nodes=[{
+            "name": n.name,
+            "maintenance": n.maintenance,
+            "cpu_used_percent": round(n.cpu.used_percent, 1),
+            "memory_used_percent": round(n.memory.used_percent, 1),
+            "disk_used_percent": round(n.disk.used_percent, 1),
+            "guests": sum(1 for g in proxlb_data.guests.values() if g.node_current == n.name),
+        } for n in proxlb_data.nodes.values()],
+        storages=[s.model_dump() for s in storages],
+        storage_actions=[a.model_dump() for a in proxlb_data.storage_actions],
+        migrations=[{
+            "guest": g.name, "id": g.id, "type": str(g.type),
+            "from": g.node_current, "to": g.node_target, "target_storage": g.target_storage,
+        } for g in proxlb_data.guests.values() if g.node_current != g.node_target],
+    )
+
 
 # Fast storage report: storages only, no guest metrics, then exit.
 if cli_args.storage_report:
@@ -117,6 +167,7 @@ def reinstall_sigint() -> None:
 
 while True:
 
+    _run_started = time.time()
     try:
         # Validate if HA mode is enabled and if this node is the HA manager.
         if proxlb_config.service.enable_ha:
@@ -271,6 +322,8 @@ while True:
             f"ProxLB: A Proxmox API call failed or a cluster node became unavailable: {api_error}. "
             "Reconnecting to the Proxmox API and restarting balancing run from scratch."
         )
+        ControlState.update(run={"started_at": _run_started, "finished_at": time.time(), "error": str(api_error)})
+        ControlState.event("error", f"Run failed: {api_error}")
         time.sleep(proxlb_config.proxmox_api.wait_time)
 
         # Reload the config to recover the real credentials (masked below after
@@ -290,6 +343,13 @@ while True:
         except Exception as exc:
             logger.error(f"IoRecovery failed: {exc}")
         IoRecovery.emergency_run = False
+
+    publish_status(proxlb_data, _run_started)
+    for _action in proxlb_data.storage_actions:
+        if _action.status in ("done", "failed"):
+            ControlState.event("storage", f"{_action.action} {_action.guest} {_action.volume} "
+                                          f"{_action.source_storage} -> {_action.target_node}:{_action.target_storage}: "
+                                          f"{_action.status}", status=_action.status)
 
     # Validate if the JSON output should be
     # printed to stdout

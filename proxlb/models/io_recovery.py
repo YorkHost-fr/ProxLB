@@ -21,6 +21,7 @@ from typing import Any, Optional
 from proxlb.models.storages import Storages
 from proxlb.models.storage_balancing import NO_TRIM_TYPES, StorageBalancing
 from proxlb.utils.config_parser import Config
+from proxlb.utils.control import ControlState
 from proxlb.utils.helper import Helper
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
@@ -141,11 +142,14 @@ class IoRecovery:
                 full_storages.update(blocking)
                 logger.critical(f"IoRecovery: not resuming {label}: storage(s) {', '.join(sorted(set(blocking)))} "
                                 "still full. Freeing space first.")
+                ControlState.event("io-error", f"{label} not resumed: storage {', '.join(sorted(set(blocking)))} still full",
+                                   vmid=vm["vmid"], status="blocked")
                 continue
 
             if IoRecovery._attempts(vm["vmid"]) >= cfg.max_resume_attempts:
                 logger.critical(f"IoRecovery: {label} was already resumed {cfg.max_resume_attempts} times within "
                                 "the last hour and keeps failing. Manual intervention required.")
+                ControlState.event("io-error", f"{label} keeps failing, given up", vmid=vm["vmid"], status="failed")
                 continue
 
             if dry_run:
@@ -156,6 +160,7 @@ class IoRecovery:
                 IoRecovery.resume_history.setdefault(vm["vmid"], []).append(time.time())
                 resumed += 1
                 logger.warning(f"IoRecovery: resumed {label}.")
+                ControlState.event("io-error", f"{label} resumed", vmid=vm["vmid"], status="resumed")
             except Exception as exc:
                 logger.error(f"IoRecovery: failed to resume {label}: {exc}")
 
