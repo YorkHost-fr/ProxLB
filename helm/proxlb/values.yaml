@@ -1,9 +1,16 @@
 image:
   registry: ghcr.io
-  repository: credativ/proxlb
-  tag: v2.4.0
-  pullPolicy: IfNotPresent
+  # YorkHost fork image (storage balancing, io-error recovery...). It is built
+  # by .github/workflows/30-pipeline-build-container.yml on every push to main.
+  repository: yorkhost-fr/proxlb
+  # Prefer an immutable 'sha-<commit>' tag in production; 'latest' follows main.
+  tag: latest
+  pullPolicy: Always
+  # The GHCR package of a private repository needs a pull secret, e.g.:
+  # kubectl create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+  #   --docker-username=<github user> --docker-password=<PAT with read:packages>
   imagePullSecrets: [ ]
+  # - name: ghcr-pull
 
 resources:
   limits:
@@ -14,22 +21,51 @@ resources:
     memory: "100Mi"
 
 labels: {}
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
 
 extraArgs:
   dryRun: false
 
+# Proxmox API credentials, injected as environment variables from a Secret
+# (PROXLB_API_*), so they never end up in the ConfigMap.
+credentials:
+  # Use an existing Secret (recommended, e.g. managed by sealed-secrets,
+  # external-secrets or SOPS). Expected keys are configured below.
+  existingSecret: ""
+  # Or let the chart create the Secret from these values (avoid committing them).
+  create: false
+  user: ""
+  tokenId: ""
+  tokenSecret: ""
+  password: ""
+  keys:
+    user: PROXLB_API_USER
+    tokenId: PROXLB_API_TOKEN_ID
+    tokenSecret: PROXLB_API_TOKEN_SECRET
+    password: PROXLB_API_PASS
+
+# Extra environment variables / volumes, e.g. to trust a private CA:
+#   extraEnv: [{ name: REQUESTS_CA_BUNDLE, value: /etc/proxlb/ca/ca.crt }]
+#   extraVolumes: [{ name: ca, configMap: { name: proxmox-ca } }]
+#   extraVolumeMounts: [{ name: ca, mountPath: /etc/proxlb/ca, readOnly: true }]
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
 configmap:
   create: true
+  # Name of an existing ConfigMap holding 'proxlb.yaml' when create is false.
+  existingConfigMap: ""
   config:
     proxmox_api:
       hosts: []
-#Can be either a user or a token
-#      user: ""
-#      pass: ""
-#      token_id: ""
-#      token_secret: ""
+      # Credentials come from the 'credentials' section above.
       ssl_verification: True
       timeout: 10
+      parallel_requests: 8
     proxmox_cluster:
       maintenance_nodes: [ ]
       maintenance_nodes_schedule:
@@ -53,8 +89,19 @@ configmap:
       balanciness: 5
       method: memory
       mode: used
+    storage_balancing:
+      enable: False
+      critical_percent: 90
+      target_max_percent: 75
+      forecast_days: 7
+      allow_node_migration: False
+      max_actions_per_run: 1
+    io_error_recovery:
+      enable: False
+      interval: 60
     service:
       daemon: True
+      # Kubernetes restarts the single pod; ProxLB's own HA mode is not needed.
       enable_ha: False
       schedule:
         interval: 12

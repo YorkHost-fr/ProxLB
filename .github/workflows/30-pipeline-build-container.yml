@@ -2,6 +2,7 @@ name: Build Container Image
 
 on:
   push:
+    branches: [ main ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
@@ -57,6 +58,9 @@ jobs:
   release:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    env:
+      # Docker Hub is optional: only used when the secrets are configured.
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -78,7 +82,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name != 'pull_request' && env.HAS_DOCKERHUB == 'true' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -90,6 +94,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ${{ steps.lowercase.outputs.result }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          # ':latest' and ':sha-<commit>' on every push to main / tag, plus the
+          # tag or branch name; Docker Hub tags only when its secrets exist.
+          tags="ghcr.io/${IMAGE}:${REF_NAME}
+          ghcr.io/${IMAGE}:latest
+          ghcr.io/${IMAGE}:sha-${SHA::7}"
+          if [ "${HAS_DOCKERHUB}" = "true" ]; then
+            tags="${tags}
+          ${IMAGE}:${REF_NAME}
+          ${IMAGE}:latest"
+          fi
+          {
+            echo "list<<EOF"
+            echo "${tags}" | sed 's/^ *//'
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -97,10 +124,6 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ steps.lowercase.outputs.result }}:${{ github.ref_name }}
-            ${{ steps.lowercase.outputs.result }}:latest
-            ghcr.io/${{ steps.lowercase.outputs.result }}:${{ github.ref_name }}
-            ghcr.io/${{ steps.lowercase.outputs.result }}:latest
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

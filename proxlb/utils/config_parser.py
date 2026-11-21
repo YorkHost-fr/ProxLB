@@ -405,6 +405,35 @@ class ConfigParser:
         logger.debug("Finished: test_config_path.")
         return config_path
 
+    # Environment variables overriding the Proxmox API credentials, so that
+    # secrets can be injected (e.g. from a Kubernetes Secret) instead of
+    # being written into the config file.
+    ENV_OVERRIDES = {
+        "PROXLB_API_HOSTS": "hosts",
+        "PROXLB_API_USER": "user",
+        "PROXLB_API_PASS": "pass",
+        "PROXLB_API_TOKEN_ID": "token_id",
+        "PROXLB_API_TOKEN_SECRET": "token_secret",
+    }
+
+    @staticmethod
+    def apply_env_overrides(data: dict[str, Any], environ: Optional[dict[str, str]] = None) -> dict[str, Any]:
+        """
+        Override proxmox_api settings from PROXLB_API_* environment variables.
+        PROXLB_API_HOSTS is a comma separated list. Empty variables are ignored.
+        """
+        env = os.environ if environ is None else environ
+        api = dict(data.get("proxmox_api") or {})
+        for variable, key in ConfigParser.ENV_OVERRIDES.items():
+            value = env.get(variable, "").strip()
+            if not value:
+                continue
+            api[key] = [h.strip() for h in value.split(",") if h.strip()] if key == "hosts" else value
+            logger.debug(f"proxmox_api.{key} set from environment variable {variable}.")
+        if api:
+            data["proxmox_api"] = api
+        return data
+
     def get_config(self) -> Config:
         """
         Parses and returns CLI arguments.
@@ -414,7 +443,8 @@ class ConfigParser:
 
         try:
             with self.config_path.open(encoding="utf-8") as config_file:
-                return Config(**yaml.load(config_file, Loader=yaml.FullLoader))
+                data = yaml.load(config_file, Loader=yaml.FullLoader) or {}
+            return Config(**ConfigParser.apply_env_overrides(data))
         except yaml.YAMLError as exception_error:
             msg = f"Error loading YAML file: {exception_error}"
             print(msg)
