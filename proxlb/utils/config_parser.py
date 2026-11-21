@@ -245,6 +245,9 @@ class Config(BaseModel):
             port: int = Field(default=8080, ge=1, le=65535)
 
         daemon: bool = True
+        # Observation mode: compute everything, execute nothing (same as the
+        # --dry-run CLI flag, but switchable from the configuration).
+        dry_run: bool = False
         enable_ha: bool = False
         control: Control = Field(default_factory=Control)
         delay: Delay = Delay()
@@ -422,6 +425,7 @@ class ConfigParser:
     # being written into the config file.
     # Hash of the configuration file content last loaded (shown by the ops panel).
     last_loaded_sha256: str = ""
+    last_loaded_path: Optional[Path] = None
 
     ENV_OVERRIDES = {
         "PROXLB_API_HOSTS": "hosts",
@@ -496,6 +500,20 @@ class ConfigParser:
         return data
 
     @staticmethod
+    def changed_on_disk() -> bool:
+        """
+        True when the configuration file differs from the one last loaded
+        (e.g. a ConfigMap updated from the ops panel, synced by the kubelet).
+        """
+        path = ConfigParser.last_loaded_path
+        if path is None or not ConfigParser.last_loaded_sha256:
+            return False
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest() != ConfigParser.last_loaded_sha256
+        except OSError:
+            return False
+
+    @staticmethod
     def validate_yaml(text: str) -> tuple[bool, list[str], list[str]]:
         """
         Validate a configuration given as YAML text, with the environment
@@ -536,6 +554,7 @@ class ConfigParser:
             data = yaml.load(raw, Loader=yaml.FullLoader) or {}
             config = Config(**ConfigParser.apply_env_overrides(data))
             ConfigParser.last_loaded_sha256 = hashlib.sha256(raw).hexdigest()
+            ConfigParser.last_loaded_path = self.config_path
             return config
         except yaml.YAMLError as exception_error:
             msg = f"Error loading YAML file: {exception_error}"

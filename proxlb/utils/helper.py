@@ -18,7 +18,7 @@ import proxmoxer
 import requests
 from datetime import datetime, timedelta, time as datetime_time
 from proxlb.utils import version
-from proxlb.utils.config_parser import Config
+from proxlb.utils.config_parser import Config, ConfigParser
 from proxlb.utils.control import ControlState
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
@@ -191,6 +191,10 @@ class Helper:
             # Sleep in short ticks so a reload (SIGHUP) or a run requested from
             # the control endpoint starts the next run without waiting.
             while remaining > 0 and not Helper.proxlb_reload:
+                if ConfigParser.changed_on_disk():
+                    logger.info("Configuration file changed: reloading it and starting a run.")
+                    Helper.proxlb_reload = True
+                    break
                 if ControlState.consume_run_request():
                     logger.info("Run requested from the control endpoint.")
                     break

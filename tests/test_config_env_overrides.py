@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from proxlb.utils.config_parser import Config, ConfigParser
 
 
@@ -20,3 +24,17 @@ def test_env_overrides_credentials_and_hosts() -> None:
 def test_env_overrides_create_section() -> None:
     data = ConfigParser.apply_env_overrides({}, {"PROXLB_API_HOSTS": "h", "PROXLB_API_USER": "u@pve"})
     assert Config(**data).proxmox_api.username == "u@pve"
+
+
+def test_changed_on_disk_and_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROXLB_API_HOSTS", "pve")
+    monkeypatch.setenv("PROXLB_API_USER", "proxlb@pve")
+    path = tmp_path / "proxlb.yaml"
+    path.write_text("service:\n  dry_run: true\n")
+    cfg = ConfigParser(path).get_config()
+    assert cfg.service.dry_run is True
+    assert ConfigParser.changed_on_disk() is False
+    path.write_text("service:\n  dry_run: false\n")
+    assert ConfigParser.changed_on_disk() is True
+    assert ConfigParser(path).get_config().service.dry_run is False
+    assert ConfigParser.changed_on_disk() is False

@@ -12,6 +12,7 @@ __copyright__ = "Copyright (C) 2025 Florian Paul Azim Hoberg (@gyptazy)"
 __license__ = "GPL-3.0"
 
 
+import hashlib
 import logging
 import signal
 import sys
@@ -86,6 +87,14 @@ if proxlb_config.service.control.enable and not cli_args.storage_report:
     )
 
 
+def dry_run() -> bool:
+    """
+    Observation mode: --dry-run on the command line or service.dry_run in the
+    (possibly reloaded) configuration.
+    """
+    return bool(cli_args.dry_run or proxlb_config.service.dry_run)
+
+
 def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> None:
     """
     Publish the outcome of a balancing run on the control endpoint.
@@ -93,7 +102,7 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
     storages = Storages.sorted_storages(proxlb_data.storages) if proxlb_data.storages else []
     ControlState.update(
         config_sha256=ConfigParser.last_loaded_sha256,
-        dry_run=bool(cli_args.dry_run),
+        dry_run=bool(dry_run()),
         run={
             "started_at": started,
             "finished_at": time.time(),
@@ -146,7 +155,7 @@ def watchdog() -> bool:
     """
     if proxlb_config.service.enable_ha and not HaStatus.is_node_ha_manager(proxmox_api):
         return False
-    IoRecovery.run(proxmox_api, proxlb_config, dry_run=cli_args.dry_run)
+    IoRecovery.run(proxmox_api, proxlb_config, dry_run=dry_run())
     requested = IoRecovery.emergency_run
     IoRecovery.emergency_run = False
     return requested
@@ -182,9 +191,22 @@ while True:
         # and reload the ProxLB configuration and adjust log level
         if Helper.proxlb_reload:
             logger.info("Reloading ProxLB configuration.")
-            proxlb_config = config_parser.get_config()
-            logger.set_log_level(proxlb_config.service.log_level)
             Helper.proxlb_reload = False
+            try:
+                proxlb_config = config_parser.get_config()
+                logger.set_log_level(proxlb_config.service.log_level)
+                ControlState.event("config", f"Configuration reloaded ({ConfigParser.last_loaded_sha256[:12]}).")
+            except SystemExit:
+                # Invalid file: keep running with the previous configuration
+                # instead of exiting (the pod would crash-loop).
+                logger.critical("Invalid configuration file, keeping the previous configuration.")
+                ControlState.event("error", "Invalid configuration file, previous configuration kept.")
+                try:
+                    ConfigParser.last_loaded_sha256 = hashlib.sha256(cli_args.config.read_bytes()).hexdigest()
+                except OSError:
+                    pass
+            proxlb_config.proxmox_api.password = "********"
+            proxlb_config.proxmox_api.token_secret = "********"
 
         # Get all required objects from the Proxmox cluster
         Helper.apply_maintenance_nodes_schedule(proxlb_config)
@@ -217,7 +239,7 @@ while True:
             fstrim_actions = StorageBalancing.plan_fstrim(proxlb_data)
             if fstrim_actions:
                 proxlb_data.storage_actions.extend(fstrim_actions)
-                if not cli_args.dry_run:
+                if not dry_run():
                     StorageBalancing.execute_fstrim(proxmox_api, fstrim_actions, workers)
                     Storages.refresh_usage(proxmox_api, proxlb_data.storages, storage_cfg, workers)
                     Storages.log_status(proxlb_data.storages)
@@ -259,7 +281,7 @@ while True:
 
             # Storage relief first: live disk moves on the same node.
             storage_migrations = StorageBalancing.migration_guest_names(proxlb_data)
-            if storage_cfg.enable and not cli_args.dry_run:
+            if storage_cfg.enable and not dry_run():
                 StorageBalancing.execute_disk_moves(proxmox_api, proxlb_data)
                 if storage_migrations and not proxlb_data.meta.balancing.enable:
                     # Resource balancing is off: only run the storage-driven migrations.
@@ -271,7 +293,7 @@ while True:
             # Perform balancing actions via Proxmox API
             _skipped_greedy_balancing = False
             if proxlb_data.meta.balancing.enable:
-                if not cli_args.dry_run:
+                if not dry_run():
                     if (_solver_cfg.enable
                             and _solver_cfg.mode == "active"):
                         if _solver_plan is not None:
@@ -307,7 +329,7 @@ while True:
             # Record whether balancing was executed or skipped (dry-run).
             if _run_file is not None and not _skipped_greedy_balancing:
                 try:
-                    _solver_shadow.finalize_run(_run_file, dry_run=cli_args.dry_run)
+                    _solver_shadow.finalize_run(_run_file, dry_run=dry_run())
                 except Exception as exc:
                     logger.warning(f"[solver] finalize_run failed: {exc}")
                 reinstall_sigint()
@@ -339,7 +361,7 @@ while True:
     # Resume VMs paused by I/O errors now that space may have been freed.
     if proxlb_config.io_error_recovery.enable:
         try:
-            IoRecovery.run(proxmox_api, proxlb_config, dry_run=cli_args.dry_run)
+            IoRecovery.run(proxmox_api, proxlb_config, dry_run=dry_run())
         except Exception as exc:
             logger.error(f"IoRecovery failed: {exc}")
         IoRecovery.emergency_run = False
