@@ -1,3 +1,6 @@
+{{- $secretName := .Values.credentials.existingSecret | default (printf "%s-credentials" .Release.Name) }}
+{{- $useSecret := or .Values.credentials.existingSecret .Values.credentials.create }}
+{{- $configMapName := .Values.configmap.existingConfigMap | default (printf "%s-config" .Release.Name) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +9,8 @@ metadata:
     {{- include "proxlb.labels" . | nindent 4 }}
 spec:
   replicas: 1 # Number of replicas cannot be more than 1
+  strategy:
+    type: Recreate # never run two balancers at the same time
   selector:
     matchLabels:
       {{- include "proxlb.labels" . | nindent 6 }}
@@ -13,6 +18,13 @@ spec:
     metadata:
       labels:
         {{- include "proxlb.labels" . | nindent 8 }}
+      annotations:
+        # Restart the pod whenever the configuration or credentials change.
+        checksum/config: {{ toYaml .Values.configmap | sha256sum }}
+        checksum/credentials: {{ toYaml .Values.credentials | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with .Values.image.imagePullSecrets }}
       imagePullSecrets:
@@ -20,6 +32,12 @@ spec:
       {{- end }}
       # not interacting with the k8s cluster
       automountServiceAccountToken: False
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: proxlb
         image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -28,17 +46,62 @@ spec:
         {{- if .Values.extraArgs.dryRun }}
           - --dry-run
         {{- end }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        {{- if $useSecret }}
+        {{- range $key := list "user" "tokenId" "tokenSecret" "password" }}
+          - name: {{ index $.Values.credentials.keys $key }}
+            valueFrom:
+              secretKeyRef:
+                name: {{ $secretName }}
+                key: {{ index $.Values.credentials.keys $key }}
+                optional: true
+        {{- end }}
+        {{- end }}
+        {{- with .Values.extraEnv }}
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         volumeMounts:
           - name: config
             mountPath: /etc/proxlb/proxlb.yaml
             subPath: proxlb.yaml
-        {{ if .Values.resources }}
+          - name: logs
+            mountPath: /var/log/proxlb
+          - name: tmp
+            mountPath: /tmp
+        {{- with .Values.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.resources }}
         resources:
-          {{ with .Values.resources }}
-            {{ toYaml . | nindent 10 }}
-          {{ end }}
-        {{ end }}
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       volumes:
         - name: config
           configMap:
-            name: proxlb-config
+            name: {{ $configMapName }}
+        - name: logs
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

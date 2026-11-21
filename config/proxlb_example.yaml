@@ -137,6 +137,12 @@ io_error_recovery:
 
 service:
   daemon: True
+  # Internal control endpoint for the YorkHost ops panel (status, run now,
+  # config validation). Token: PROXLB_CONTROL_TOKEN (env or PROXLB_ENV_FILE).
+  control:
+    enable: False
+    bind: 0.0.0.0
+    port: 8080
   enable_ha: True                     # Run ProxLB in HA mode using shared state in Proxmox cluster (requires Proxmox VE 8.4+)
   schedule:
     interval: 12

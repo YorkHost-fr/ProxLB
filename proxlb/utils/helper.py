@@ -18,7 +18,8 @@ import proxmoxer
 import requests
 from datetime import datetime, timedelta, time as datetime_time
 from proxlb.utils import version
-from proxlb.utils.config_parser import Config
+from proxlb.utils.config_parser import Config, ConfigParser
+from proxlb.utils.control import ControlState
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
 from concurrent.futures import ThreadPoolExecutor
@@ -66,6 +67,7 @@ class Helper:
             Checks if the daemon mode is active and handles the scheduling accordingly.
     """
     proxlb_reload = False
+    daemon_tick: float = 5.0
     weekdays = {
         "monday": 0,
         "tuesday": 1,
@@ -181,22 +183,34 @@ class Helper:
         if proxlb_config.service.daemon:
 
             logger.info(f"Daemon mode active: Next run in: {proxlb_config.service.schedule}.")
-            remaining = proxlb_config.service.schedule.seconds
-            if watchdog is not None and proxlb_config.io_error_recovery.enable:
-                interval = proxlb_config.io_error_recovery.interval
-                while remaining > 0 and not Helper.proxlb_reload:
-                    step = min(interval, remaining)
-                    time.sleep(step)
-                    remaining -= step
-                    if remaining > 0:
-                        try:
-                            if watchdog():
-                                logger.warning("Watchdog requested an immediate run.")
-                                break
-                        except Exception as exc:
-                            logger.error(f"Watchdog run failed: {exc}")
-            else:
-                time.sleep(remaining)
+            remaining = float(proxlb_config.service.schedule.seconds)
+            ControlState.update(next_run_at=time.time() + remaining)
+            interval = proxlb_config.io_error_recovery.interval if (
+                watchdog is not None and proxlb_config.io_error_recovery.enable) else 0
+            since_watchdog = 0.0
+            # Sleep in short ticks so a reload (SIGHUP) or a run requested from
+            # the control endpoint starts the next run without waiting.
+            while remaining > 0 and not Helper.proxlb_reload:
+                if ConfigParser.changed_on_disk():
+                    logger.info("Configuration file changed: reloading it and starting a run.")
+                    Helper.proxlb_reload = True
+                    break
+                if ControlState.consume_run_request():
+                    logger.info("Run requested from the control endpoint.")
+                    break
+                step = min(Helper.daemon_tick, remaining)
+                time.sleep(step)
+                remaining -= step
+                since_watchdog += step
+                if interval and watchdog is not None and since_watchdog >= interval and remaining > 0:
+                    since_watchdog = 0.0
+                    try:
+                        if watchdog():
+                            logger.warning("Watchdog requested an immediate run.")
+                            break
+                    except Exception as exc:
+                        logger.error(f"Watchdog run failed: {exc}")
+            ControlState.update(next_run_at=None)
 
         else:
             logger.debug("Successfully executed ProxLB. Daemon mode not active - stopping.")

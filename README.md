@@ -350,6 +350,9 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | node_resource_reserve |  | { default: { memory: 4 }, { node01: { memory: 6 }} } | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
+| *Environment* | `PROXLB_ENV_FILE` |  | /secrets/.env | `Str` | Optional dotenv file read for the `PROXLB_*` variables below (real environment variables win). |
+|  | `PROXLB_API_HOSTS` / `PROXLB_API_USER` / `PROXLB_API_PASS` / `PROXLB_API_TOKEN_ID` / `PROXLB_API_TOKEN_SECRET` |  |  | `Str` | Override the `proxmox_api` hosts (comma separated) and credentials, so secrets stay out of the config file. |
+|  | `PROXLB_CONTROL_TOKEN` |  |  | `Str` | Bearer token of the control endpoint. |
 | `storage_balancing` |  |  |  |  |  |
 |  | enable |  | False | `Bool` | Detect full / soon-full storages and relieve them (fstrim, disk move, migration). See [Storage Balancing](docs/03_configuration.md#storage-balancing--io-error-recovery). |
 |  | warning_percent |  | 80 | `Float` | Fill level from which a storage is reported. |
@@ -378,6 +381,10 @@ The following options can be set in the configuration file `proxlb.yaml`:
 | `service` |  |  |  |  |  |
 |  | daemon |  | True | `Bool` | If daemon mode should be activated. |
 |  | enable_ha |  | False | `Bool` | Enables HA mode of ProxLB. |
+|  | `control` |  |  | `Dict` | Internal HTTP control endpoint used by the YorkHost ops panel: `GET /healthz`, `GET /status`, `POST /run`, `POST /validate`. All routes but `/healthz` require `Authorization: Bearer $PROXLB_CONTROL_TOKEN`. |
+|  |  | enable | False | `Bool` | Start the control endpoint. |
+|  |  | bind | 0.0.0.0 | `Str` | Listen address. |
+|  |  | port | 8080 | `Int` | Listen port. |
 |  | `schedule` |  |  | `Dict` | Schedule config block for rebalancing. |
 |  |  | interval | 12 | `Int` | How often rebalancing should occur in daemon mode.|
 |  |  | format | hours | `Str` | Sets the time format. [values: `hours` (default), `minutes`]|

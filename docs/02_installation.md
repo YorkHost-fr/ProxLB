@@ -107,6 +107,24 @@ docker run -it --rm -v $(pwd)/proxlb.yaml:/etc/proxlb/proxlb.yaml proxlb
 
 *Note: ProxLB container images are officially only available at ghcr.io/credativ/proxlb or docker.io/credativ/proxlb*
 
+### Kubernetes (Helm)
+The chart in `helm/proxlb` runs a single ProxLB pod (never more than one balancer at a time) using the fork image `ghcr.io/yorkhost-fr/proxlb`, published by CI on every push to `main` (`:latest`, `:sha-<commit>`) and on `v*` tags.
+
+Credentials are injected from a Kubernetes Secret as `PROXLB_API_*` environment variables (`PROXLB_API_USER`, `PROXLB_API_TOKEN_ID`, `PROXLB_API_TOKEN_SECRET`, `PROXLB_API_PASS`, `PROXLB_API_HOSTS`), which override the `proxmox_api` section of the config file, so no secret ends up in the ConfigMap or in Git.
+
+```bash
+kubectl create namespace proxlb
+kubectl -n proxlb create secret generic proxlb-api \
+  --from-literal=PROXLB_API_USER='proxlb@pve' \
+  --from-literal=PROXLB_API_TOKEN_ID='proxlb' \
+  --from-literal=PROXLB_API_TOKEN_SECRET='<token secret>'
+helm upgrade --install proxlb ./helm/proxlb -n proxlb \
+  --set credentials.existingSecret=proxlb-api \
+  -f my-values.yaml          # configmap.config: your ProxLB configuration
+```
+
+Any change of `configmap.config` or `credentials` rolls the pod automatically (checksum annotations). For a private registry or a private CA use `image.imagePullSecrets`, `extraEnv`, `extraVolumes` and `extraVolumeMounts` (see `helm/proxlb/values.yaml`). The configuration can also be managed through GitOps (e.g. an Argo CD Application pointing to the chart and a values file).
+
 ### Source
 ProxLB can also easily be used from the provided sources - for traditional systems but also as a Docker/Podman container image.
 
