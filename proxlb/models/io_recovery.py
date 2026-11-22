@@ -43,6 +43,43 @@ class IoRecovery:
     resume_history: dict[int, list[float]] = {}
     # Set when the watchdog wants the main loop to run a balancing pass now.
     emergency_run: bool = False
+    # Back-off of those emergency runs (see request_emergency).
+    last_emergency_request: float = 0.0
+    emergency_delay: float = 0.0
+    emergency_pending_outcome: bool = False
+
+    @staticmethod
+    def request_emergency(cfg: Config.IoErrorRecovery, now: Optional[float] = None) -> bool:
+        """
+        Request an immediate balancing run, unless one was requested less than
+        the current back-off delay ago. Returns True when requested.
+        """
+        now = time.time() if now is None else now
+        delay = IoRecovery.emergency_delay or cfg.emergency_min_interval
+        elapsed = now - IoRecovery.last_emergency_request
+        if IoRecovery.last_emergency_request and elapsed < delay:
+            logger.info(f"IoRecovery: next emergency run in {int(delay - elapsed)}s "
+                        f"(back-off {int(delay)}s, the last ones could not free space).")
+            return False
+        IoRecovery.last_emergency_request = now
+        IoRecovery.emergency_run = True
+        IoRecovery.emergency_pending_outcome = True
+        return True
+
+    @staticmethod
+    def report_run_outcome(cfg: Config.IoErrorRecovery, relief_actions: int) -> None:
+        """
+        Called after each balancing run: an emergency run that found nothing to
+        free doubles the back-off delay; any relief action resets it.
+        """
+        if relief_actions > 0:
+            IoRecovery.emergency_delay = float(cfg.emergency_min_interval)
+        elif IoRecovery.emergency_pending_outcome:
+            current = IoRecovery.emergency_delay or cfg.emergency_min_interval
+            IoRecovery.emergency_delay = float(min(current * 2, cfg.emergency_max_interval))
+            logger.warning(f"IoRecovery: the emergency run could not free any space; next one in "
+                           f"{int(IoRecovery.emergency_delay)}s at the earliest.")
+        IoRecovery.emergency_pending_outcome = False
 
     @staticmethod
     def scan(proxmox_api: ProxmoxApi, proxlb_config: Config) -> list[dict[str, Any]]:
@@ -88,6 +125,10 @@ class IoRecovery:
 
     @staticmethod
     def storage_has_room(storage: ProxLbData.Storage, cfg: Config.IoErrorRecovery) -> bool:
+        if not storage.active:
+            return False
+        if storage.metadata_used_percent is not None and 100 - storage.metadata_used_percent < max(cfg.min_free_percent, 1.0):
+            return False
         required = max(storage.total * cfg.min_free_percent / 100, cfg.min_free_gib * GIB)
         return storage.avail >= required
 
@@ -99,9 +140,11 @@ class IoRecovery:
         return len(history)
 
     @staticmethod
-    def run(proxmox_api: ProxmoxApi, proxlb_config: Config, dry_run: bool = False) -> int:
+    def run(proxmox_api: ProxmoxApi, proxlb_config: Config, dry_run: bool = False, request_run: bool = True) -> int:
         """
         Detect and recover paused VMs. Returns the number of resumed VMs.
+        With request_run, a still full storage triggers an immediate balancing
+        run (subject to the back-off); right after a run it is not needed.
         """
         cfg = proxlb_config.io_error_recovery
         if not cfg.enable:
@@ -165,13 +208,13 @@ class IoRecovery:
                 logger.error(f"IoRecovery: failed to resume {label}: {exc}")
 
         if full_storages and not dry_run:
-            IoRecovery._free_space(proxmox_api, proxlb_config, storages, full_storages)
+            IoRecovery._free_space(proxmox_api, proxlb_config, storages, full_storages, request_run)
 
         return resumed
 
     @staticmethod
     def _free_space(proxmox_api: ProxmoxApi, proxlb_config: Config,
-                    storages: dict[str, ProxLbData.Storage], keys: set[str]) -> None:
+                    storages: dict[str, ProxLbData.Storage], keys: set[str], request_run: bool = True) -> None:
         """
         Emergency relief for full storages: fstrim in every VM with the guest
         agent and discard-enabled disks on them, then ask the main loop for an
@@ -207,6 +250,5 @@ class IoRecovery:
             if actions:
                 StorageBalancing.execute_fstrim(proxmox_api, actions, workers)
 
-        if storage_cfg.enable:
+        if request_run and storage_cfg.enable and IoRecovery.request_emergency(proxlb_config.io_error_recovery):
             logger.warning("IoRecovery: requesting an immediate storage balancing run.")
-            IoRecovery.emergency_run = True

@@ -31,7 +31,7 @@ _UNUSED_KEY = re.compile(r"^unused\d+$")
 _SIZE = re.compile(r"^(\d+(?:\.\d+)?)([KMGTP]?)$", re.IGNORECASE)
 _SIZE_UNITS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
 
-STATUS_ORDER = {"critical": 0, "forecast": 1, "warning": 2, "ok": 3}
+STATUS_ORDER = {"critical": 0, "inactive": 1, "forecast": 2, "warning": 3, "ok": 4}
 PROBLEM_STATUSES = ("critical", "forecast")
 
 
@@ -158,10 +158,11 @@ class Storages:
         storages: dict[str, ProxLbData.Storage] = {}
         for node, entries in Helper.parallel_map(list_node, list(node_names), workers):
             for entry in entries:
-                if int(entry.get("active", 0)) != 1 or int(entry.get("enabled", 1)) != 1:
+                if int(entry.get("enabled", 1)) != 1:
                     continue
+                active = int(entry.get("active", 0)) == 1
                 total = int(entry.get("total") or 0)
-                if total <= 0:
+                if active and total <= 0:
                     continue
                 shared = bool(int(entry.get("shared", 0)))
                 key = Storages.storage_key(node, entry["storage"], shared)
@@ -179,7 +180,10 @@ class Storages:
                     total=total,
                     used=int(entry.get("used") or 0),
                     avail=int(entry.get("avail") or 0),
+                    active=active,
                 )
+
+        Storages.fill_thin_metadata(proxmox_api, storages, workers)
 
         if with_forecast and config.forecast:
             def growth(storage: ProxLbData.Storage) -> float:
@@ -191,7 +195,8 @@ class Storages:
                     return 0.0
                 return Storages.linear_growth_per_day(list(rows))
 
-            for storage, value in zip(storages.values(), Helper.parallel_map(growth, list(storages.values()), workers)):
+            measured = [s for s in storages.values() if s.active]
+            for storage, value in zip(measured, Helper.parallel_map(growth, measured, workers)):
                 storage.growth_bytes_per_day = value
 
         for storage in storages.values():
@@ -199,6 +204,41 @@ class Storages:
 
         logger.debug("Finished: get_storages.")
         return storages
+
+    @staticmethod
+    def fill_thin_metadata(proxmox_api: ProxmoxApi, storages: dict[str, ProxLbData.Storage], workers: int = 8) -> None:
+        """
+        Read the metadata usage of the LVM thin pools backing 'lvmthin'
+        storages (cluster storage definitions give the vgname/thinpool, the
+        node's disks/lvmthin listing gives the metadata usage). One request for
+        the storage definitions plus one per node with an lvmthin storage.
+        """
+        thin = [s for s in storages.values() if s.type == "lvmthin" and s.active]
+        if not thin:
+            return
+        try:
+            definitions = {str(d.get("storage")): d for d in proxmox_api.storage.get()}
+        except Exception as exc:
+            logger.debug(f"Storage: could not read storage definitions: {exc}")
+            return
+
+        def pools(node: str) -> list[dict[str, Any]]:
+            try:
+                return list(proxmox_api.nodes(node).disks.lvmthin.get())
+            except Exception as exc:
+                logger.debug(f"Storage: could not list thin pools of node {node}: {exc}")
+                return []
+
+        nodes = sorted({s.node for s in thin})
+        by_node = dict(zip(nodes, Helper.parallel_map(pools, nodes, workers)))
+        for storage in thin:
+            definition = definitions.get(storage.name) or {}
+            for pool in by_node.get(storage.node, []):
+                if pool.get("lv") == definition.get("thinpool") and pool.get("vg") == definition.get("vgname"):
+                    size = float(pool.get("metadata_size") or 0)
+                    if size > 0:
+                        storage.metadata_used_percent = float(pool.get("metadata_used") or 0) / size * 100
+                    break
 
     @staticmethod
     def refresh_usage(proxmox_api: ProxmoxApi, storages: dict[str, ProxLbData.Storage],
@@ -214,6 +254,8 @@ class Storages:
                 storage.used = fresh[key].used
                 storage.avail = fresh[key].avail
                 storage.total = fresh[key].total
+                storage.active = fresh[key].active
+                storage.metadata_used_percent = fresh[key].metadata_used_percent
             Storages.classify(storage, config)
 
     @staticmethod
@@ -273,6 +315,11 @@ class Storages:
         """
         Compute the derived fields (percentages, ETA) and the status of a storage.
         """
+        if not storage.active:
+            storage.status = "inactive"
+            storage.used_percent = storage.projected_percent = 0.0
+            storage.days_until_full = storage.days_until_critical = None
+            return
         total = storage.total or 1
         storage.used_percent = storage.used / total * 100
         growth = max(0.0, storage.growth_bytes_per_day) if config.forecast else 0.0
@@ -287,12 +334,14 @@ class Storages:
         else:
             storage.days_until_critical = None
 
-        if storage.used_percent >= config.critical_percent:
+        metadata = storage.metadata_used_percent or 0.0
+        storage.limit = "metadata" if metadata > storage.used_percent else "data"
+        if storage.used_percent >= config.critical_percent or metadata >= config.critical_percent:
             storage.status = "critical"
         elif (config.forecast and storage.days_until_critical is not None
               and storage.days_until_critical <= config.forecast_days):
             storage.status = "forecast"
-        elif storage.used_percent >= config.warning_percent:
+        elif storage.used_percent >= config.warning_percent or metadata >= config.warning_percent:
             storage.status = "warning"
         else:
             storage.status = "ok"
@@ -302,8 +351,12 @@ class Storages:
         """
         Apply a planned change of `delta_bytes` (positive: data added) to a storage.
         """
+        before = storage.used
         storage.used = max(0, storage.used + delta_bytes)
         storage.avail = max(0, storage.total - storage.used)
+        # Thin pool metadata grows and shrinks roughly with the allocated data.
+        if storage.metadata_used_percent is not None and before > 0:
+            storage.metadata_used_percent *= storage.used / before
         Storages.classify(storage, config)
 
     # ------------------------------------------------------------------ #
@@ -330,11 +383,14 @@ class Storages:
                 return "-"
             return "now" if value <= 0 else f"{value:.1f}d"
 
-        header = f"{'STATUS':<9} {'STORAGE':<32} {'TYPE':<9} {'USED%':>6} {'USED GiB':>10} {'TOTAL GiB':>10} {'GROWTH/d':>9} {'CRIT IN':>8} {'FULL IN':>8}"
+        header = (f"{'STATUS':<9} {'STORAGE':<32} {'TYPE':<9} {'USED%':>6} {'META%':>6} {'USED GiB':>10} "
+                  f"{'TOTAL GiB':>10} {'GROWTH/d':>9} {'CRIT IN':>8} {'FULL IN':>8}")
         lines = [header, "-" * len(header)]
         for s in Storages.sorted_storages(storages):
             lines.append(
-                f"{s.status.upper():<9} {s.key:<32} {s.type:<9} {s.used_percent:>5.1f}% {gib(s.used):>10} {gib(s.total):>10} "
+                f"{s.status.upper():<9} {s.key:<32} {s.type:<9} {s.used_percent:>5.1f}% "
+                f"{(f'{s.metadata_used_percent:.1f}%' if s.metadata_used_percent is not None else '-'):>6} "
+                f"{gib(s.used):>10} {gib(s.total):>10} "
                 f"{gib(s.growth_bytes_per_day):>9} {days(s.days_until_critical):>8} {days(s.days_until_full):>8}")
 
         if guests:
@@ -354,7 +410,13 @@ class Storages:
         for s in Storages.sorted_storages(storages):
             if s.status == "ok":
                 continue
+            if s.status == "inactive":
+                logger.critical(f"Storage {s.key} ({s.type}) is enabled but NOT ACTIVE on {s.node}: "
+                                "guests using it get I/O errors. Check the storage on that node.")
+                continue
             eta = f", reaches critical in {s.days_until_critical:.1f} days" if s.days_until_critical else ""
+            if s.limit == "metadata" and s.metadata_used_percent is not None:
+                eta += f", thin pool METADATA {s.metadata_used_percent:.1f}% used"
             message = (f"Storage {s.key} ({s.type}) is {s.status.upper()}: {s.used_percent:.1f}% used "
                        f"({s.avail / GIB:.1f} GiB free, growth {s.growth_bytes_per_day / GIB:+.2f} GiB/day{eta}).")
             if s.status == "critical":

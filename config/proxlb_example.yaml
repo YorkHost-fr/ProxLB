@@ -134,6 +134,8 @@ io_error_recovery:
   min_free_percent: 2                 # Don't resume while a VM storage has less free space...
   min_free_gib: 1                     # ...than max(min_free_percent, min_free_gib)
   max_resume_attempts: 3              # Per VM and per hour, then give up and alert
+  emergency_min_interval: 120         # Min. seconds between two immediate runs for a full storage
+  emergency_max_interval: 1800        # Back-off ceiling while those runs cannot free anything
 
 service:
   daemon: True

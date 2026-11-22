@@ -442,6 +442,8 @@ A quick overview, worst storage first, is printed by:
 proxlb -c /etc/proxlb/proxlb.yaml --storage-report
 ```
 
+For `lvmthin` storages the **thin pool metadata** usage is read as well (`nodes/<node>/disks/lvmthin`): a full metadata area causes I/O errors while the data area still has room, so the status is driven by the higher of both (`limit: metadata` in the report), the relief is sized for it and a destination whose metadata would exceed `target_max_percent` is refused. Storages that are enabled but **not active** on their node (failed disk, lost NFS/Ceph...) are reported with the status `inactive` and a critical log line; they are never used as a destination.
+
 #### Relief (critical and forecast storages)
 ProxLB escalates from the least to the most disruptive action and stops as soon as the storage is back under `target_max_percent` (including the growth expected over `forecast_days`):
 
@@ -457,6 +459,7 @@ When a storage fills up, QEMU pauses the affected VMs with the `io-error` status
 * if one of the VM's storages still has less free space than `max(min_free_percent, min_free_gib)`, the VM is **not** resumed (it would fail again immediately): ProxLB runs fstrim on the VMs of that storage and starts a balancing run right away to move disks / migrate guests;
 * once there is room again, the VM is resumed (`status/resume`);
 * VMs holding a lock are never touched, and a VM is given up after `max_resume_attempts` resumes within one hour (logged as critical).
+* immediate runs are spaced by at least `emergency_min_interval` seconds; while they cannot free anything (no destination with room), the delay doubles up to `emergency_max_interval`, and it resets as soon as a run plans or executes an action.
 
 #### Required permissions
 In addition to the permissions listed above, the storage balancer and the watchdog need `VM.Config.Disk` and `Datastore.AllocateSpace` (disk moves), `VM.PowerMgmt` (resume) and, for fstrim, `VM.Monitor` (PVE 8) or the guest agent file system permission `VM.GuestAgent.FileSystemMgmt` / `VM.GuestAgent.Unrestricted` (PVE 9).

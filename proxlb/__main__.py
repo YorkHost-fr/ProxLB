@@ -358,13 +358,16 @@ while True:
         Helper.get_daemon_mode(proxlb_config, watchdog)
         continue
 
+    # Back-off of the emergency runs: did this run find something to free?
+    IoRecovery.report_run_outcome(proxlb_config.io_error_recovery, sum(
+        1 for _a in proxlb_data.storage_actions if _a.status in ("planned", "done")))
+
     # Resume VMs paused by I/O errors now that space may have been freed.
     if proxlb_config.io_error_recovery.enable:
         try:
-            IoRecovery.run(proxmox_api, proxlb_config, dry_run=dry_run())
+            IoRecovery.run(proxmox_api, proxlb_config, dry_run=dry_run(), request_run=False)
         except Exception as exc:
             logger.error(f"IoRecovery failed: {exc}")
-        IoRecovery.emergency_run = False
 
     publish_status(proxlb_data, _run_started)
     for _action in proxlb_data.storage_actions:

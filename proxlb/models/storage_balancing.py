@@ -62,8 +62,12 @@ class StorageBalancing:
         A destination fits when it stays below target_max_percent after the
         move and does not reach critical_percent within the forecast horizon.
         """
-        if storage.total <= 0 or size > storage.avail:
+        if storage.total <= 0 or size > storage.avail or not storage.active:
             return False
+        if storage.metadata_used_percent is not None and storage.used > 0:
+            metadata_after = storage.metadata_used_percent * (storage.used + size) / storage.used
+            if metadata_after > config.target_max_percent:
+                return False
         after = storage.used + size
         if after / storage.total * 100 > config.target_max_percent:
             return False
@@ -89,7 +93,13 @@ class StorageBalancing:
         """Bytes to free so the storage gets back under target_max_percent
         including the growth expected over the forecast horizon."""
         growth = max(0.0, storage.growth_bytes_per_day) if config.forecast else 0.0
-        return storage.used + growth * config.forecast_days - storage.total * config.target_max_percent / 100
+        need = storage.used + growth * config.forecast_days - storage.total * config.target_max_percent / 100
+        # Thin pool metadata full: freeing x % of the allocated data frees
+        # about x % of the metadata.
+        metadata = storage.metadata_used_percent
+        if metadata and metadata > config.target_max_percent and storage.used > 0:
+            need = max(need, storage.used * (1 - config.target_max_percent / metadata))
+        return need
 
     # ------------------------------------------------------------------ #
     # Step 1: fstrim                                                      #
