@@ -19,7 +19,7 @@ from proxlb.utils.config_parser import Config
 from proxlb.utils.proxlb_data import ProxLbData
 from pydantic import BaseModel
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, assert_never
+from typing import TYPE_CHECKING, Any, Optional, assert_never
 from requests.exceptions import ConnectionError
 
 if TYPE_CHECKING:
@@ -288,7 +288,7 @@ class Balancing:
         proxlb_data.meta.balancing.storage_reservations.pop(guest_name, None)
 
     @staticmethod
-    def _storage_fits(storage: dict, required_bytes: int, reserved_bytes: int,
+    def _storage_fits(storage: dict[str, Any], required_bytes: int, reserved_bytes: int,
                       balancing: "ProxLbData.Meta.Balancing") -> bool:
         """
         Decide whether a storage can hold an additional `required_bytes` while
@@ -434,7 +434,7 @@ class Balancing:
         logger.debug(
             f"Balancing: selected target storage '{target_storage['storage']}' on node "
             f"{target_node} ({int(target_storage.get('avail', 0)) // (1024 ** 3)} GiB free).")
-        return target_storage["storage"]
+        return str(target_storage["storage"])
 
     @staticmethod
     def _exec_rebalancing_vm(proxmox_api: ProxmoxApi, proxlb_data: ProxLbData, guest_name: str) -> Optional[str]:

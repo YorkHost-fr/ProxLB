@@ -17,7 +17,7 @@ try:
 except ImportError:
     PYYAML_PRESENT = False
 from enum import StrEnum
-from typing import Any, Optional, assert_never
+from typing import Any, Optional
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 from pathlib import Path
 from proxlb.utils.logger import SystemdLogger
@@ -213,8 +213,7 @@ class Config(BaseModel):
                 return self.disk_threshold
             elif method == self.Resource.Memory:
                 return self.memory_threshold
-            else:
-                assert_never(method)
+            raise ValueError(f"unexpected base resource: {method}")
 
     class Service(BaseModel):
 

@@ -13,19 +13,20 @@ __license__ = "GPL-3.0"
 
 
 import proxmoxer
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 from proxlb.models.balancing import Balancing
 
 
-def _proxlb_data(target_storage_auto: bool = False, target_storage_map=None) -> MagicMock:
+def _proxlb_data(target_storage_auto: bool = False, target_storage_map: Optional[dict[str, str]] = None) -> MagicMock:
     data = MagicMock()
     data.meta.balancing.target_storage_auto = target_storage_auto
     data.meta.balancing.target_storage_map = target_storage_map
     return data
 
 
-def _api(storages) -> MagicMock:
+def _api(storages: list[dict[str, Any]]) -> MagicMock:
     """Build a proxmox_api mock whose nodes(x).storage.get() returns `storages`."""
     api = MagicMock()
     api.nodes.return_value.storage.get.return_value = storages

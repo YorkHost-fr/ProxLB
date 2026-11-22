@@ -1,4 +1,4 @@
-from typing import Any, Literal, Optional, TypeVar, assert_never
+from typing import Any, Literal, Optional, TypeVar
 from pydantic import BaseModel
 from proxlb.utils.config_parser import Config
 
@@ -117,7 +117,7 @@ class ProxLbData(BaseModel):
                 return self.disk
             if name == BalancingResource.Memory:
                 return self.memory
-            assert_never(name)
+            raise ValueError(f"unexpected base resource: {name}")
 
     class Node(BaseModel):
         class Metric(BaseModel):
@@ -155,7 +155,7 @@ class ProxLbData(BaseModel):
                 return self.disk
             if name == BalancingResource.Memory:
                 return self.memory
-            assert_never(name)
+            raise ValueError(f"unexpected base resource: {name}")
 
     class Storage(BaseModel):
         key: str                         # '<node>::<id>' or 'shared::<id>'
