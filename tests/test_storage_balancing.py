@@ -178,6 +178,7 @@ def test_plan_moves_disk_to_other_local_storage_first() -> None:
     assert data.storages["pve1::local-lvm"].used == 55 * GIB
     assert data.storages["pve1::data"].used == 140 * GIB
     assert data.guests["big"].node_target == "pve1"
+    assert action.reason == "pve1::local-lvm is critical (95.0% used)"
 
 
 def test_plan_migrates_when_no_local_destination() -> None:
