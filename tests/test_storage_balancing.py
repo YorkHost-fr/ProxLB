@@ -151,7 +151,8 @@ def test_get_storages_dedupes_shared_storage() -> None:
     }
     api.nodes.side_effect = lambda node: MagicMock(storage=MagicMock(get=MagicMock(return_value=entries[node])))
     storages = Storages.get_storages(api, ["pve1", "pve2"], Config.StorageBalancing(forecast=False), workers=2)
-    assert set(storages) == {"pve1::local-lvm", "shared::ceph"}
+    assert set(storages) == {"pve1::local-lvm", "shared::ceph", "pve1::offline"}
+    assert storages["pve1::offline"].status == "inactive"
     assert storages["shared::ceph"].nodes == ["pve1", "pve2"]
     assert storages["pve1::local-lvm"].status == "critical"
     assert "CRITICAL" in Storages.format_report(storages).splitlines()[2]
@@ -292,3 +293,56 @@ def test_execute_disk_moves_reports_failure() -> None:
     api.nodes.return_value.tasks.return_value.status.get.return_value = {"status": "stopped", "exitstatus": "no space"}
     assert StorageBalancing.execute_disk_moves(api, data, poll_interval=0) is False
     assert data.storage_actions[0].status == "failed"
+
+
+# ---------------------------------------------------------------------- #
+# Thin pool metadata / inactive storages                                  #
+# ---------------------------------------------------------------------- #
+def test_thin_pool_metadata_is_read_and_drives_status() -> None:
+    api = MagicMock()
+    node_api = MagicMock()
+    node_api.storage.get.return_value = [
+        {"storage": "local-lvm", "type": "lvmthin", "active": 1, "shared": 0, "content": "images,rootdir",
+         "total": 100 * GIB, "used": 40 * GIB, "avail": 60 * GIB},
+    ]
+    node_api.disks.lvmthin.get.return_value = [
+        {"lv": "data", "vg": "pve", "metadata_size": 1000, "metadata_used": 960},
+        {"lv": "other", "vg": "pve", "metadata_size": 1000, "metadata_used": 10},
+    ]
+    api.nodes.return_value = node_api
+    api.storage.get.return_value = [{"storage": "local-lvm", "type": "lvmthin", "vgname": "pve", "thinpool": "data"}]
+    storages = Storages.get_storages(api, ["pve1"], Config.StorageBalancing(forecast=False), workers=1)
+    st = storages["pve1::local-lvm"]
+    assert st.metadata_used_percent == 96.0
+    assert st.status == "critical" and st.limit == "metadata"
+    assert "96.0%" in Storages.format_report(storages)
+
+
+def test_metadata_full_storage_is_relieved() -> None:
+    full_meta = _storage("pve1::local-lvm", 100, 40)
+    full_meta.metadata_used_percent = 96.0
+    Storages.classify(full_meta, Config.StorageBalancing())
+    other = _storage("pve1::data", 1000, 0, type_="lvm")
+    vm = _vm("vm1", "pve1", [("scsi0", "local-lvm", 20)])
+    actions = StorageBalancing.plan(_data([full_meta, other], [vm]))
+    assert [a.action for a in actions] == ["move_disk"]
+    # 40 -> 20 GiB allocated: metadata scales down to ~48 %.
+    assert full_meta.metadata_used_percent is not None and full_meta.metadata_used_percent < 75
+
+
+def test_destination_with_full_metadata_is_refused() -> None:
+    full = _storage("pve1::local-lvm", 100, 95)
+    meta_full_dest = _storage("pve1::data", 1000, 100)
+    meta_full_dest.metadata_used_percent = 74.0
+    vm = _vm("vm1", "pve1", [("scsi0", "local-lvm", 40)])
+    assert StorageBalancing.plan(_data([full, meta_full_dest], [vm], allow_node_migration=False)) == []
+
+
+def test_inactive_storage_is_never_a_destination_nor_acted_on() -> None:
+    full = _storage("pve1::local-lvm", 100, 95)
+    dead = _storage("pve1::data", 1000, 0)
+    dead.active = False
+    Storages.classify(dead, Config.StorageBalancing())
+    assert dead.status == "inactive"
+    vm = _vm("vm1", "pve1", [("scsi0", "local-lvm", 40)])
+    assert StorageBalancing.plan(_data([full, dead], [vm], allow_node_migration=False)) == []

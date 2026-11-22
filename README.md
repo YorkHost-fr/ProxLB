@@ -378,6 +378,8 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | min_free_percent |  | 2 | `Float` | A VM is not resumed while one of its storages has less free space than `max(min_free_percent, min_free_gib)`. |
 |  | min_free_gib |  | 1 | `Float` | See `min_free_percent`. |
 |  | max_resume_attempts |  | 3 | `Int` | Maximum resumes per VM and hour before giving up and alerting. |
+|  | emergency_min_interval |  | 120 | `Int` | Minimum seconds between two immediate balancing runs requested by the watchdog for a full storage. |
+|  | emergency_max_interval |  | 1800 | `Int` | The delay between those runs doubles up to this value while they cannot free anything, and resets as soon as one plans or executes an action. |
 | `service` |  |  |  |  |  |
 |  | daemon |  | True | `Bool` | If daemon mode should be activated. |
 |  | enable_ha |  | False | `Bool` | Enables HA mode of ProxLB. |

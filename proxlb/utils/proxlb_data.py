@@ -161,7 +161,12 @@ class ProxLbData(BaseModel):
         projected_percent: float = 0.0
         days_until_full: Optional[float] = None
         days_until_critical: Optional[float] = None
-        status: str = "ok"               # ok | warning | forecast | critical
+        status: str = "ok"               # ok | warning | forecast | critical | inactive
+        active: bool = True              # False: enabled but not active on the node (failure)
+        # lvmthin only: thin pool metadata usage. A full metadata area causes
+        # I/O errors even though the data area still has free space.
+        metadata_used_percent: Optional[float] = None
+        limit: str = "data"              # what drives the status: data | metadata
 
     class StorageAction(BaseModel):
         action: Literal["fstrim", "move_disk", "migrate"]

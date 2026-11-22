@@ -329,6 +329,12 @@ class Config(BaseModel):
         min_free_gib: float = Field(default=1.0, ge=0)
         # Give up on a VM after this many resumes within one hour.
         max_resume_attempts: int = Field(default=3, ge=1)
+        # Immediate balancing runs requested by the watchdog for a full storage
+        # are spaced by at least emergency_min_interval seconds; the delay
+        # doubles (up to emergency_max_interval) while those runs cannot free
+        # anything, and resets as soon as one plans or executes an action.
+        emergency_min_interval: int = Field(default=120, ge=30)
+        emergency_max_interval: int = Field(default=1800, ge=60)
 
     class Solver(BaseModel):
         class Method(StrEnum):
