@@ -80,6 +80,13 @@ class StorageBalancing:
         return storage.total * config.target_max_percent / 100 - storage.used - size
 
     @staticmethod
+    def _reason(storage: ProxLbData.Storage) -> str:
+        """Why a storage is relieved, captured before the move is accounted for."""
+        level = storage.metadata_used_percent if storage.limit == "metadata" else storage.used_percent
+        what = "thin pool metadata" if storage.limit == "metadata" else "used"
+        return f"{storage.key} is {storage.status} ({level:.1f}% {what})"
+
+    @staticmethod
     def _eligible(guest: ProxLbData.Guest, respect_planned_moves: bool) -> bool:
         if guest.ignore or guest.lock:
             return False
@@ -282,13 +289,14 @@ class StorageBalancing:
             return None
 
         target = max(destinations, key=lambda s: StorageBalancing._headroom(s, volume.size, config))
+        reason = StorageBalancing._reason(source)
         Storages.account(source, -StorageBalancing._freed(volume), config)
         Storages.account(target, volume.size, config)
         return ProxLbData.StorageAction(
             action="move_disk", guest=guest.name, guest_id=guest.id, guest_type=guest.type,
             node=node, target_node=node, volume=volume.key,
             source_storage=source.key, target_storage=target.name, size=volume.size,
-            reason=f"{source.key} is {source.status}",
+            reason=reason,
         )
 
     @staticmethod
@@ -356,6 +364,7 @@ class StorageBalancing:
             return None
 
         _, _, target_node, target = best
+        reason = StorageBalancing._reason(source)
         for key, volume in local_volumes:
             Storages.account(proxlb_data.storages[key], -StorageBalancing._freed(volume), config)
         Storages.account(target, size, config)
@@ -375,7 +384,7 @@ class StorageBalancing:
             action="migrate", guest=guest.name, guest_id=guest.id, guest_type=guest.type,
             node=guest.node_current, target_node=target_node,
             source_storage=source.key, target_storage=target.name, size=size,
-            reason=f"{source.key} is {source.status}",
+            reason=reason,
         )
 
     # ------------------------------------------------------------------ #
