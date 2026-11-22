@@ -346,3 +346,15 @@ def test_inactive_storage_is_never_a_destination_nor_acted_on() -> None:
     assert dead.status == "inactive"
     vm = _vm("vm1", "pve1", [("scsi0", "local-lvm", 40)])
     assert StorageBalancing.plan(_data([full, dead], [vm], allow_node_migration=False)) == []
+
+
+def test_forecast_ignores_mostly_empty_storage() -> None:
+    # 27.8 % used but +284 GiB/day after a one-off burst: not 'forecast'.
+    burst = _storage("pve8::ssd-thin", 1740, 484, growth_gib_day=284)
+    assert burst.status == "ok"
+    assert burst.days_until_critical is not None and burst.days_until_critical < 7
+    # Same growth above the floor: forecast.
+    assert _storage("pve8::ssd-thin", 1740, 1300, growth_gib_day=284).status == "forecast"
+    # Floor configurable.
+    cfg = Config.StorageBalancing(forecast_min_percent=0)
+    assert _storage("pve8::ssd-thin", 1740, 484, growth_gib_day=284, cfg=cfg).status == "forecast"

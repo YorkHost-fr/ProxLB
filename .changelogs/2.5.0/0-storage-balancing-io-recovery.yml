@@ -6,3 +6,4 @@ changed:
 - Collect node, guest and storage metrics concurrently (parallel_requests) and without per-request sleeps (@yorkhost-fr). [#0]
 - Monitor LVM thin pool metadata usage and report inactive storages (@yorkhost-fr). [#0]
 - Back off emergency runs requested by the io-error watchdog when nothing can be freed (@yorkhost-fr). [#0]
+- Only forecast storages already filled above storage_balancing.forecast_min_percent (default 70) (@yorkhost-fr). [#0]

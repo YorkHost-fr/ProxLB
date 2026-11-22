@@ -360,6 +360,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | target_max_percent |  | 75 | `Float` | Fill level aimed for on a relieved storage and maximum fill level accepted on a destination storage. Must be lower than `critical_percent`. |
 |  | forecast |  | True | `Bool` | Also relieve storages forecast (linear trend of the RRD history) to reach `critical_percent` within `forecast_days`. |
 |  | forecast_days |  | 7 | `Float` | Forecast horizon in days. |
+|  | forecast_min_percent |  | 70 | `Float` | A storage below this fill level is never `forecast` (a one-off burst such as disks migrated onto it would otherwise be extrapolated into a fake "full in N days"). |
 |  | forecast_timeframe |  | week | `Str` | RRD history used for the trend. [values: `hour`, `day`, `week` (default), `month`, `year`] |
 |  | strategy |  | disk_move_first | `Str` | Order of the relief steps after fstrim. [values: `disk_move_first` (default), `migrate_first`] |
 |  | allow_disk_move |  | True | `Bool` | Allow live moves of VM disks to another storage of the same node. |

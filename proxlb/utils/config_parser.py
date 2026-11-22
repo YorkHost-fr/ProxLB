@@ -285,6 +285,10 @@ class Config(BaseModel):
         # forecast_days, based on the growth trend of forecast_timeframe.
         forecast: bool = True
         forecast_days: float = Field(default=7.0, ge=0)
+        # A storage below this fill level is never 'forecast': a one-off burst
+        # (disks migrated onto it, a restore) would otherwise be extrapolated
+        # into a fake "full in N days" on a mostly empty storage.
+        forecast_min_percent: float = Field(default=70.0, ge=0, le=100)
         forecast_timeframe: Timeframe = Timeframe.Week
         strategy: Strategy = Strategy.DiskMoveFirst
         allow_disk_move: bool = True
