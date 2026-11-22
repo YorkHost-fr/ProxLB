@@ -95,21 +95,14 @@ def dry_run() -> bool:
     return bool(cli_args.dry_run or proxlb_config.service.dry_run)
 
 
-def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> None:
+def publish_config() -> None:
     """
-    Publish the outcome of a balancing run on the control endpoint.
+    Publish the loaded configuration (mode, features) on the control endpoint
+    right away: at start-up and after a reload, before the run completes.
     """
-    storages = Storages.sorted_storages(proxlb_data.storages) if proxlb_data.storages else []
     ControlState.update(
         config_sha256=ConfigParser.last_loaded_sha256,
         dry_run=bool(dry_run()),
-        run={
-            "started_at": started,
-            "finished_at": time.time(),
-            "duration": round(time.time() - started, 1),
-            "error": error,
-            "balance_required": proxlb_data.meta.balancing.balance,
-        },
         features={
             "balancing": proxlb_config.balancing.enable,
             "storage_balancing": proxlb_config.storage_balancing.enable,
@@ -117,6 +110,23 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
             "solver": proxlb_config.solver.enable,
             "method": str(proxlb_config.balancing.method),
             "mode": str(proxlb_config.balancing.mode),
+        },
+    )
+
+
+def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> None:
+    """
+    Publish the outcome of a balancing run on the control endpoint.
+    """
+    storages = Storages.sorted_storages(proxlb_data.storages) if proxlb_data.storages else []
+    publish_config()
+    ControlState.update(
+        run={
+            "started_at": started,
+            "finished_at": time.time(),
+            "duration": round(time.time() - started, 1),
+            "error": error,
+            "balance_required": proxlb_data.meta.balancing.balance,
         },
         nodes=[{
             "name": n.name,
@@ -154,6 +164,10 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
             "exclude_storages": proxlb_config.storage_balancing.exclude_storages,
         },
     )
+
+
+if proxlb_config.service.control.enable and not cli_args.storage_report:
+    publish_config()
 
 
 # Fast storage report: storages only, no guest metrics, then exit.
@@ -219,6 +233,7 @@ while True:
                 proxlb_config = config_parser.get_config()
                 logger.set_log_level(proxlb_config.service.log_level)
                 ControlState.event("config", f"Configuration reloaded ({ConfigParser.last_loaded_sha256[:12]}).")
+                publish_config()
             except SystemExit:
                 # Invalid file: keep running with the previous configuration
                 # instead of exiting (the pod would crash-loop).
