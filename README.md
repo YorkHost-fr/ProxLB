@@ -319,6 +319,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | retries |  | 1 | `Int` | How often a connection attempt to the defined API host should be performed. |
 |  | wait_time |  | 1 | `Int` | How many seconds should be waited before performing another connection attempt to the API host. |
 |  | parallel_requests |  | 8 | `Int` | Number of concurrent API requests while collecting node, guest and storage metrics. `1` restores sequential collection. |
+|  | guest_rrd |  | auto | `Str` | Per-guest RRD history (2 requests per guest). `auto` fetches it only when used (PSI mode or thresholds, `cpu` method, solver); otherwise the guest CPU comes from the guest listing. [values: `auto`, `always`, `never`] |
 | `proxmox_cluster` |  |  |  |  |  |
 |  | maintenance_nodes |  | ['virt66.example.com'] | `List` | A list of Proxmox nodes that are defined to be in a maintenance. (must be the same node names as used within the cluster) |
 |  | maintenance_nodes_schedule |  |  | `Dict` | A weekly schedule that temporarily adds nodes to `maintenance_nodes` during runtime. |
@@ -339,6 +340,9 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | target_storage_min_free_percent |  | 10.0 | `Float` | Safety margin kept free on the target storage, as a percentage of its total capacity. Used by `target_storage_capacity_guard`.|
 |  | target_storage_min_free_gib |  | 0 | `Int` | Absolute safety-margin floor in GiB. The effective margin is `max(percent-of-total, this)`. For thin-provisioned pools, set this and/or the percentage high enough to cover overcommit.|
 |  | balance_types |  | ['vm', 'ct'] | `List` | Defined the types of guests that should be honored. [values: `vm`, `ct`]|
+|  | max_node_inflow |  | 1 | `Int` | Maximum number of guests planned onto a single node per run (maintenance evacuations excepted). |
+|  | max_migrations_per_run |  |  | `Int` | Maximum number of migrations planned by the resource balancer per run; the rest is left for the next run. (Optional) |
+|  | memory_target_max_percent |  |  | `Float` | Highest RAM usage a target node may reach with the migrated guest, e.g. `93` on clusters run close to full RAM (swap, KSM sharing lost by a migrated guest). (Optional) |
 |  | max_job_validation |  | 1800 | `Int` | How long a job validation may take in seconds. (default: 1800) |
 |  | balanciness |  | 10 | `Int` | The maximum delta of resource usage between node with highest and lowest usage. |
 |  | memory_threshold |  | 75 | `Int` | The maximum threshold (in percent) that needs to be hit to perform balancing actions. (Optional) |
@@ -357,6 +361,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | enable |  | False | `Bool` | Detect full / soon-full storages and relieve them (fstrim, disk move, migration). See [Storage Balancing](docs/03_configuration.md#storage-balancing--io-error-recovery). |
 |  | warning_percent |  | 80 | `Float` | Fill level from which a storage is reported. |
 |  | critical_percent |  | 90 | `Float` | Fill level from which a storage is considered full and relieved. |
+|  | warning_free_gib / critical_free_gib / target_free_gib |  | 200 / 100 / 300 | `Float` | Thresholds in free GiB, combined with the percentages: for each level the free space required is the smaller of both, so a 100 GB storage is judged by the percentage and a 4 TB one by the absolute free space. (Optional) |
 |  | target_max_percent |  | 75 | `Float` | Fill level aimed for on a relieved storage and maximum fill level accepted on a destination storage. Must be lower than `critical_percent`. |
 |  | forecast |  | True | `Bool` | Also relieve storages forecast (linear trend of the RRD history) to reach `critical_percent` within `forecast_days`. |
 |  | forecast_days |  | 7 | `Float` | Forecast horizon in days. |

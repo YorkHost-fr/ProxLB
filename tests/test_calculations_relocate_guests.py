@@ -198,9 +198,12 @@ def test_target_node_is_recalculated_between_migrations() -> None:
     assert targets["g-small"] == "node-B", (
         f"Expected g-small -> node-B, got {targets['g-small']}"
     )
-    assert targets["g-large"] == "node-C", (
-        f"Expected g-large -> node-C (most free after first migration), "
-        f"got {targets['g-large']}"
+    # After g-small left, node-A is at 55 %. Moving g-large to node-C would
+    # bring node-C to 75 % and node-A to 10 %: worse than before, the next run
+    # would move it back. The ping-pong guard keeps it on node-A, and it is
+    # in any case never stacked onto node-B.
+    assert targets["g-large"] == "node-A", (
+        f"Expected g-large to stay on node-A (ping-pong guard), got {targets['g-large']}"
     )
 
 

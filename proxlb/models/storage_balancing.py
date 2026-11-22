@@ -69,15 +69,14 @@ class StorageBalancing:
             if metadata_after > config.target_max_percent:
                 return False
         after = storage.used + size
-        if after / storage.total * 100 > config.target_max_percent:
+        if after > Storages.target_used(storage, config):
             return False
         growth = max(0.0, storage.growth_bytes_per_day) if config.forecast else 0.0
-        projected = (after + growth * config.forecast_days) / storage.total * 100
-        return projected < config.critical_percent
+        return after + growth * config.forecast_days < Storages.critical_used(storage, config)
 
     @staticmethod
     def _headroom(storage: ProxLbData.Storage, size: int, config: StorageConfig) -> float:
-        return storage.total * config.target_max_percent / 100 - storage.used - size
+        return Storages.target_used(storage, config) - storage.used - size
 
     @staticmethod
     def _reason(storage: ProxLbData.Storage) -> str:
@@ -85,6 +84,42 @@ class StorageBalancing:
         level = storage.metadata_used_percent if storage.limit == "metadata" else storage.used_percent
         what = "thin pool metadata" if storage.limit == "metadata" else "used"
         return f"{storage.key} is {storage.status} ({level:.1f}% {what})"
+
+    @staticmethod
+    def place_local_volumes(proxlb_data: ProxLbData, guest: ProxLbData.Guest, target_node: str) -> bool:
+        """
+        Storage check of a migration planned by the resource balancer: the
+        node-local volumes of `guest` must fit on one storage of `target_node`
+        (same rules as the storage balancer). On success the space is
+        accounted for (source freed, destination reserved) and the storage is
+        recorded as guest.target_storage, so execution uses the same one.
+        Guests without node-local volumes always fit.
+        """
+        config = StorageBalancing._config(proxlb_data)
+        local = []
+        for volume in guest.volumes:
+            key = Storages.volume_storage_key(proxlb_data.storages, guest.node_current, volume.storage)
+            if key is not None and not proxlb_data.storages[key].shared:
+                local.append((key, volume))
+        size = sum(v.size for _, v in local)
+        if size <= 0:
+            return True
+        content = "images" if guest.type == GuestType.Vm else "rootdir"
+        candidates = [
+            s for s in proxlb_data.storages.values()
+            if not s.shared and s.node == target_node and content in s.content
+            and s.name not in config.exclude_storages and StorageBalancing._fits(s, size, config)
+        ]
+        if not candidates:
+            logger.info(f"Storage: no storage on {target_node} can take the {size / GIB:.0f} GiB of local disks "
+                        f"of {guest.name}; migration not planned.")
+            return False
+        target = max(candidates, key=lambda s: StorageBalancing._headroom(s, size, config))
+        for key, volume in local:
+            Storages.account(proxlb_data.storages[key], -StorageBalancing._freed(volume), config)
+        Storages.account(target, size, config)
+        guest.target_storage = target.name
+        return True
 
     @staticmethod
     def _eligible(guest: ProxLbData.Guest, respect_planned_moves: bool) -> bool:
@@ -100,7 +135,7 @@ class StorageBalancing:
         """Bytes to free so the storage gets back under target_max_percent
         including the growth expected over the forecast horizon."""
         growth = max(0.0, storage.growth_bytes_per_day) if config.forecast else 0.0
-        need = storage.used + growth * config.forecast_days - storage.total * config.target_max_percent / 100
+        need = storage.used + growth * config.forecast_days - Storages.target_used(storage, config)
         # Thin pool metadata full: freeing x % of the allocated data frees
         # about x % of the metadata.
         metadata = storage.metadata_used_percent
@@ -375,7 +410,7 @@ class StorageBalancing:
         previous = (proxlb_data.meta.balancing.balance_next_guest, proxlb_data.meta.balancing.balance_next_node)
         proxlb_data.meta.balancing.balance_next_guest = guest.name
         proxlb_data.meta.balancing.balance_next_node = target_node
-        Calculations.update_node_resources(proxlb_data)
+        Calculations.update_node_resources(proxlb_data, check_storage=False)
         proxlb_data.meta.balancing.balance_next_guest, proxlb_data.meta.balancing.balance_next_node = previous
         guest.node_target = target_node
         guest.target_storage = target.name

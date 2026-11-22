@@ -90,12 +90,15 @@ class Guests:
 
         running = [entry for listed in Helper.parallel_map(list_node, list(nodes.keys()), workers) for entry in listed]
 
+        with_rrd = Guests.needs_rrd(proxlb_config)
+        logger.debug(f"Guest RRD history {'fetched' if with_rrd else 'skipped (not used by this configuration)'}.")
+
         def fetch(entry: tuple[str, GuestType, Any]) -> tuple[dict[str, Any], 'GuestRrdDatasets']:
             node, guest_type, guest = entry
-            return (
-                Guests.get_guest_config(proxmox_api, node, guest['vmid'], guest_type),
-                Guests.get_guest_rrd_datasets(proxmox_api, node, guest['vmid'], guest['name'], guest_type),
-            )
+            rrd: 'GuestRrdDatasets' = RrdDatasets(average=[], maximum=[])
+            if with_rrd:
+                rrd = Guests.get_guest_rrd_datasets(proxmox_api, node, guest['vmid'], guest['name'], guest_type)
+            return Guests.get_guest_config(proxmox_api, node, guest['vmid'], guest_type), rrd
 
         fetched = Helper.parallel_map(fetch, running, workers)
 
@@ -113,7 +116,9 @@ class Guests:
                 name=name,
                 cpu=ProxLbData.Guest.Metric(
                     total=int(guest['cpus']),
-                    used=value('cpu'),
+                    # Hourly average from the RRD, or the current usage of the
+                    # guest listing when the RRD history is not fetched.
+                    used=value('cpu') if with_rrd else float(guest.get('cpu') or 0.0),
                     pressure_some_percent=value('pressurecpusome'),
                     pressure_full_percent=value('pressurecpufull'),
                     pressure_some_spikes_percent=value('pressurecpusome', spikes=True),
@@ -162,6 +167,24 @@ class Guests:
 
         logger.debug("Finished: get_guests.")
         return guests
+
+    @staticmethod
+    def needs_rrd(proxlb_config: Config) -> bool:
+        """
+        Whether the per-guest RRD history is used by this configuration: PSI
+        mode or PSI thresholds (pressure values), the cpu balancing method
+        (hourly CPU average) or the CP-SAT solver (all metrics).
+        """
+        mode = proxlb_config.proxmox_api.guest_rrd
+        if mode != "auto":
+            return mode == "always"
+        balancing = proxlb_config.balancing
+        return (
+            balancing.mode == Config.Balancing.Mode.Psi
+            or balancing.psi is not None
+            or Config.Balancing.base_resource(balancing.method) == Config.Balancing.Resource.Cpu
+            or proxlb_config.solver.enable
+        )
 
     @staticmethod
     def get_guest_config(proxmox_api: ProxmoxApi, node_name: str, vm_id: int, guest_type: GuestType) -> dict[str, Any]:

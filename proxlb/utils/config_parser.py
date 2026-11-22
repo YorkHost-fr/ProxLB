@@ -60,6 +60,11 @@ class Config(BaseModel):
         # Number of concurrent API requests used while collecting node, guest
         # and storage metrics. 1 restores the former sequential behaviour.
         parallel_requests: int = Field(default=8, ge=1)
+        # Per-guest RRD history (2 requests per guest): 'auto' fetches it only
+        # when something uses it (PSI mode or thresholds, cpu method, solver);
+        # otherwise the guest CPU comes from the guest listing. 'always' /
+        # 'never' force it.
+        guest_rrd: str = Field(default="auto", pattern="^(auto|always|never)$")
 
     class ProxmoxCluster(BaseModel):
         class MaintenanceNodesSchedule(BaseModel):
@@ -131,6 +136,12 @@ class Config(BaseModel):
         live: bool = True
         max_job_validation: int = 1800
         max_node_inflow: Optional[int] = 1
+        # Guard rails of the greedy balancer (None = unlimited / disabled):
+        # max_migrations_per_run caps the migrations planned per run;
+        # memory_target_max_percent is the highest RAM usage a target node may
+        # reach with the migrated guest (keep headroom for swap / lost KSM).
+        max_migrations_per_run: Optional[int] = Field(default=None, ge=1)
+        memory_target_max_percent: Optional[float] = Field(default=None, gt=0, le=100)
         memory_threshold: Optional[int] = None
         disk_threshold: Optional[int] = None
         method: "Config.Balancing.Resource" = Resource.Memory
@@ -281,6 +292,14 @@ class Config(BaseModel):
         # Fill level ProxLB aims for on a relieved storage, and the maximum fill
         # level accepted on a destination storage after a move.
         target_max_percent: float = Field(default=75.0, gt=0, le=100)
+        # Thresholds in free GiB: a percentage alone does not fit both a 100 GB
+        # and a 4 TB storage. For each level the free space required is the
+        # SMALLER of the percentage and the GiB value, so small storages are
+        # judged by the percentage and large ones by the absolute free space.
+        # None = percentage only.
+        warning_free_gib: Optional[float] = Field(default=None, gt=0)
+        critical_free_gib: Optional[float] = Field(default=None, gt=0)
+        target_free_gib: Optional[float] = Field(default=None, gt=0)
         # Forecast: act on storages expected to reach critical_percent within
         # forecast_days, based on the growth trend of forecast_timeframe.
         forecast: bool = True
@@ -313,6 +332,11 @@ class Config(BaseModel):
                 raise ValueError("storage_balancing.warning_percent must be <= critical_percent")
             if self.target_max_percent >= self.critical_percent:
                 raise ValueError("storage_balancing.target_max_percent must be < critical_percent")
+            if self.critical_free_gib is not None:
+                if self.warning_free_gib is not None and self.warning_free_gib < self.critical_free_gib:
+                    raise ValueError("storage_balancing.warning_free_gib must be >= critical_free_gib")
+                if self.target_free_gib is not None and self.target_free_gib <= self.critical_free_gib:
+                    raise ValueError("storage_balancing.target_free_gib must be > critical_free_gib")
             return self
 
     class IoErrorRecovery(BaseModel):

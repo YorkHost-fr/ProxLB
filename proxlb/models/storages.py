@@ -311,6 +311,32 @@ class Storages:
         return cov / var_t * 86400.0
 
     @staticmethod
+    def free_required(total: float, percent: float, gib: Optional[float]) -> float:
+        """
+        Free bytes matching a fill-level threshold: (100 - percent) % of the
+        total, capped at `gib` GiB when given (large storages are judged by the
+        absolute free space, small ones by the percentage).
+        """
+        free = total * (100 - percent) / 100
+        if gib is not None:
+            free = min(free, gib * GIB)
+        return free
+
+    @staticmethod
+    def critical_used(storage: ProxLbData.Storage, config: StorageConfig) -> float:
+        """Used bytes from which the storage is critical."""
+        return storage.total - Storages.free_required(storage.total, config.critical_percent, config.critical_free_gib)
+
+    @staticmethod
+    def warning_used(storage: ProxLbData.Storage, config: StorageConfig) -> float:
+        return storage.total - Storages.free_required(storage.total, config.warning_percent, config.warning_free_gib)
+
+    @staticmethod
+    def target_used(storage: ProxLbData.Storage, config: StorageConfig) -> float:
+        """Highest used bytes aimed for (relief target / destination limit)."""
+        return storage.total - Storages.free_required(storage.total, config.target_max_percent, config.target_free_gib)
+
+    @staticmethod
     def classify(storage: ProxLbData.Storage, config: StorageConfig) -> None:
         """
         Compute the derived fields (percentages, ETA) and the status of a storage.
@@ -326,7 +352,7 @@ class Storages:
         storage.projected_percent = (storage.used + growth * config.forecast_days) / total * 100
 
         storage.days_until_full = (total - storage.used) / growth if growth > 0 else None
-        critical_bytes = config.critical_percent / 100 * total
+        critical_bytes = Storages.critical_used(storage, config)
         if storage.used >= critical_bytes:
             storage.days_until_critical = 0.0
         elif growth > 0:
@@ -336,13 +362,13 @@ class Storages:
 
         metadata = storage.metadata_used_percent or 0.0
         storage.limit = "metadata" if metadata > storage.used_percent else "data"
-        if storage.used_percent >= config.critical_percent or metadata >= config.critical_percent:
+        if storage.used >= critical_bytes or metadata >= config.critical_percent:
             storage.status = "critical"
         elif (config.forecast and storage.days_until_critical is not None
               and storage.days_until_critical <= config.forecast_days
               and max(storage.used_percent, metadata) >= config.forecast_min_percent):
             storage.status = "forecast"
-        elif storage.used_percent >= config.warning_percent or metadata >= config.warning_percent:
+        elif storage.used >= Storages.warning_used(storage, config) or metadata >= config.warning_percent:
             storage.status = "warning"
         else:
             storage.status = "ok"

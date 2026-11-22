@@ -266,7 +266,8 @@ class Calculations:
         return None
 
     @staticmethod
-    def get_most_free_node(proxlb_data: ProxLbData, return_node: bool = False, guest_node_relation_list: Optional[list[str]] = None) -> Optional[ProxLbData.Node]:
+    def get_most_free_node(proxlb_data: ProxLbData, return_node: bool = False, guest_node_relation_list: Optional[list[str]] = None,
+                           ignore_inflow: bool = False) -> Optional[ProxLbData.Node]:
         """
         Get the name of the Proxmox node in the cluster with the most free resources based on
         the user defined method (e.g.: memory) and mode (e.g.: used).
@@ -298,6 +299,18 @@ class Calculations:
             filtered_nodes = [
                 node for node in proxlb_data.nodes.values() if not node.maintenance
             ]
+
+        # max_node_inflow: a node that already receives that many guests in this
+        # run is not a target any more (maintenance evacuations ignore it).
+        inflow_limit = proxlb_data.meta.balancing.max_node_inflow
+        if inflow_limit and not ignore_inflow and filtered_nodes:
+            inflow = proxlb_data.meta.balancing.node_inflow
+            open_nodes = [node for node in filtered_nodes if inflow.get(node.name, 0) < inflow_limit]
+            if not open_nodes:
+                logger.info(f"All candidate nodes already receive {inflow_limit} guest(s) in this run (max_node_inflow).")
+                proxlb_data.meta.balancing.balance_next_node = None
+                return None
+            filtered_nodes = open_nodes
 
         if not filtered_nodes:
             # log an error if filtered_nodes is empty
@@ -373,7 +386,7 @@ class Calculations:
             # Update the node with the most free nodes which is
             # not in a maintenance
             proxlb_data.meta.balancing.balance_next_guest = guest_name
-            if Calculations.get_most_free_node(proxlb_data):
+            if Calculations.get_most_free_node(proxlb_data, ignore_inflow=True):
                 Calculations.update_node_resources(proxlb_data)
             else:
                 logger.warning(f"Warning: Could not find a suitable node to relocate guest {guest_name} from a maintenance node.")
@@ -436,8 +449,14 @@ class Calculations:
                 )
             )
 
+            max_migrations = proxlb_data.meta.balancing.max_migrations_per_run
+
             # Iterate over all affinity groups
             for group_name in sorted_guest_usage_groups:
+
+                if max_migrations and proxlb_data.meta.balancing.planned_migrations >= max_migrations:
+                    logger.info(f"Reached max_migrations_per_run ({max_migrations}): remaining balancing left for the next run.")
+                    break
 
                 # Validate balanciness again before processing each group
                 Calculations.get_balanciness(proxlb_data)
@@ -473,6 +492,12 @@ class Calculations:
                             logger.warning(f"Skipping relocation of guest {guest_name} due to insufficient resources on target node {proxlb_data.meta.balancing.balance_next_node}. This might affect affinity group {group_name}.")
                         continue
 
+                    if not Calculations.validate_balancing_move(proxlb_data, guest_name):
+                        continue
+
+                    if max_migrations and proxlb_data.meta.balancing.planned_migrations >= max_migrations:
+                        break
+
                     if mode == BalancingMode.Psi:
                         logger.debug(f"Evaluating guest relocation based on {mode} mode.")
                         method = proxlb_data.meta.balancing.method
@@ -493,9 +518,53 @@ class Calculations:
 
                     Calculations.val_anti_affinity(proxlb_data, guest_name)
                     Calculations.val_node_relationships(proxlb_data, guest_name)
-                    Calculations.update_node_resources(proxlb_data)
+                    if not Calculations.update_node_resources(proxlb_data):
+                        Calculations.place_on_next_node(proxlb_data, guest_name)
 
         logger.debug("Finished: relocate_guests.")
+
+    @staticmethod
+    def place_on_next_node(proxlb_data: ProxLbData, guest_name: str) -> bool:
+        """
+        The preferred target was refused (typically: its storages cannot take the
+        guest's local disks). Try the other nodes, most free first, with the same
+        checks (maintenance, inflow, pinning, anti-affinity, RAM, ping-pong,
+        storage) instead of giving up on the guest.
+        """
+        balancing = proxlb_data.meta.balancing
+        guest = proxlb_data.guests[guest_name]
+        tried = {guest.node_current}
+        if balancing.balance_next_node:
+            tried.add(balancing.balance_next_node)
+        blocked = Calculations.get_anti_affinity_blocked_nodes(proxlb_data, guest_name)
+        method, mode = balancing.method, balancing.mode
+
+        def load(node: ProxLbData.Node) -> float:
+            metric = node.metric(method)
+            if mode == BalancingMode.Assigned:
+                return metric.assigned_percent
+            if mode == BalancingMode.Psi:
+                return metric.pressure_full_spikes_percent
+            return metric.used_percent
+
+        candidates = sorted(
+            (n for n in proxlb_data.nodes.values()
+             if n.name not in tried and not n.maintenance and n.name not in blocked
+             and (not guest.node_relationships or n.name in guest.node_relationships)
+             and (not balancing.max_node_inflow or balancing.node_inflow.get(n.name, 0) < balancing.max_node_inflow)),
+            key=load,
+        )
+        for node in candidates:
+            balancing.balance_next_node = node.name
+            if not Calculations.validate_node_resources(proxlb_data, guest_name, node.name):
+                continue
+            if not Calculations.validate_balancing_move(proxlb_data, guest_name):
+                continue
+            if Calculations.update_node_resources(proxlb_data):
+                logger.info(f"{guest_name}: planned on {node.name} instead (the preferred target could not take it).")
+                return True
+        balancing.balance_next_node = None
+        return False
 
     @staticmethod
     def get_anti_affinity_blocked_nodes(proxlb_data: ProxLbData, guest_name: str) -> set[str]:
@@ -671,7 +740,7 @@ class Calculations:
         logger.debug("Finished: val_node_relationships.")
 
     @staticmethod
-    def update_node_resources(proxlb_data: ProxLbData) -> None:
+    def update_node_resources(proxlb_data: ProxLbData, check_storage: bool = True) -> bool:
         """
         Updates the resource allocation and usage statistics for nodes when a guest
         is moved from one node to another.
@@ -694,14 +763,22 @@ class Calculations:
 
         if guest_name is None or guest_name == "":
             logger.debug("No guest defined to update node resources for.")
-            return
+            return False
 
         node_current = proxlb_data.guests[guest_name].node_current
         node_target = proxlb_data.meta.balancing.balance_next_node
 
         if node_target is None:
             logger.debug(f"No target node defined to update node resources for guest {guest_name}.")
-            return
+            return False
+
+        moving = node_target != node_current and not proxlb_data.guests[guest_name].ignore
+        # Storage aware: the node-local disks must fit on the target node
+        # (only when storage balancing collected the storages).
+        if moving and check_storage and proxlb_data.storages:
+            from proxlb.models.storage_balancing import StorageBalancing  # local import: avoid import cycle
+            if not StorageBalancing.place_local_volumes(proxlb_data, proxlb_data.guests[guest_name], node_target):
+                return False
 
         # Update resources for the target node by the moved guest resources
         # Add assigned resources to the target node
@@ -749,7 +826,13 @@ class Calculations:
         Calculations.recalc_node_statistics(proxlb_data, node_target)
         Calculations.recalc_node_statistics(proxlb_data, node_current)
 
+        if moving:
+            inflow = proxlb_data.meta.balancing.node_inflow
+            inflow[node_target] = inflow.get(node_target, 0) + 1
+            proxlb_data.meta.balancing.planned_migrations += 1
+
         logger.debug("Finished: update_node_resources.")
+        return True
 
     @staticmethod
     def validate_affinity_map(proxlb_data: ProxLbData) -> None:
@@ -886,6 +969,56 @@ class Calculations:
             if len(nodes) != len(set(nodes)):
                 return False
 
+        return True
+
+    @staticmethod
+    def validate_balancing_move(proxlb_data: ProxLbData, guest_name: str) -> bool:
+        """
+        Guard rails of a balancing move (not applied to maintenance evacuations):
+
+        * memory_target_max_percent: the target node's RAM usage with the guest
+          must stay at or below this ceiling (headroom for swap / lost KSM
+          sharing on clusters run close to full RAM);
+        * no ping-pong: in 'used' / 'assigned' mode the target must not end up
+          more loaded than the source after the move, otherwise the next run
+          would simply move the guest back.
+        """
+        balancing = proxlb_data.meta.balancing
+        node_target = balancing.balance_next_node
+        guest = proxlb_data.guests[guest_name]
+        if node_target is None or node_target == guest.node_current:
+            return True
+        target = proxlb_data.nodes[node_target]
+        source = proxlb_data.nodes[guest.node_current]
+
+        ceiling = balancing.memory_target_max_percent
+        if ceiling and target.memory.total:
+            after = (target.memory.used + guest.memory.used) / target.memory.total * 100
+            if after > ceiling:
+                logger.info(f"Not moving {guest_name} to {node_target}: RAM would reach {after:.1f}% "
+                            f"(memory_target_max_percent {ceiling}%).")
+                return False
+
+        # Moves that fix an enforced (anti-)affinity or pinning rule are not
+        # load balancing: they are never blocked by the ping-pong guard.
+        fixes_rule = (
+            (balancing.enforce_affinity and not Calculations.validate_current_anti_affinity(proxlb_data, guest_name))
+            or (balancing.enforce_pinning and bool(guest.node_relationships)
+                and guest.node_current not in guest.node_relationships)
+        )
+        if balancing.mode in (BalancingMode.Used, BalancingMode.Assigned) and not fixes_rule:
+            method = balancing.method
+            t, s, g = target.metric(method), source.metric(method), guest.metric(method)
+            if balancing.mode == BalancingMode.Used:
+                t_after = (t.used + g.used) / t.total * 100 if t.total else 0.0
+                s_after = (s.used - g.used) / s.total * 100 if s.total else 0.0
+            else:
+                t_after = (t.assigned + g.total) / t.total * 100 if t.total else 0.0
+                s_after = (s.assigned - g.total) / s.total * 100 if s.total else 0.0
+            if t_after > s_after:
+                logger.debug(f"Not moving {guest_name} to {node_target}: target would be more loaded "
+                             f"({t_after:.1f}%) than the source ({s_after:.1f}%).")
+                return False
         return True
 
     @staticmethod
