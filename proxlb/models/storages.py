@@ -124,6 +124,31 @@ class Storages:
         return f"shared::{storage_id}" if shared else f"{node}::{storage_id}"
 
     @staticmethod
+    def matches(storage: ProxLbData.Storage, patterns: Iterable[str]) -> bool:
+        """
+        Does a storage match one of the patterns: '<storage>' (every node),
+        '<node>::<storage>' or 'shared::<storage>'?
+        """
+        return any(p == storage.name or p == storage.key for p in patterns)
+
+    @staticmethod
+    def apply_roles(storages: dict[str, ProxLbData.Storage], config: StorageConfig,
+                    decommission: Config.Decommission) -> None:
+        """
+        Exceptions and decommissioning: 'drain' (being emptied), 'excluded'
+        (fully ignored) and 'no_target' (never a destination).
+        """
+        for storage in storages.values():
+            if Storages.matches(storage, decommission.storages):
+                storage.role = "drain"
+            elif Storages.matches(storage, config.exclude_storages):
+                storage.role = "excluded"
+            elif Storages.matches(storage, config.no_target_storages):
+                storage.role = "no_target"
+            else:
+                storage.role = ""
+
+    @staticmethod
     def volume_storage_key(storages: dict[str, ProxLbData.Storage], node: str, storage_id: str) -> Optional[str]:
         """
         Resolve the storage key of a volume located on `storage_id` as seen from `node`.
@@ -265,7 +290,7 @@ class Storages:
         many bytes each guest volume really allocates (thin provisioning). This
         lets the planner know how much space a move actually frees.
         """
-        problem = [s for s in proxlb_data.storages.values() if s.status in PROBLEM_STATUSES]
+        problem = [s for s in proxlb_data.storages.values() if s.status in PROBLEM_STATUSES or s.role == "drain"]
         if not problem:
             return
 

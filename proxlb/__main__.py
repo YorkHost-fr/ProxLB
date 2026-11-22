@@ -121,6 +121,8 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
         nodes=[{
             "name": n.name,
             "maintenance": n.maintenance,
+            "drain": n.drain,
+            "no_target": n.no_target,
             "cpu_used_percent": round(n.cpu.used_percent, 1),
             "memory_used_percent": round(n.memory.used_percent, 1),
             "disk_used_percent": round(n.disk.used_percent, 1),
@@ -131,7 +133,26 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
         migrations=[{
             "guest": g.name, "id": g.id, "type": str(g.type),
             "from": g.node_current, "to": g.node_target, "target_storage": g.target_storage,
+            "reason": g.move_reason or "balancing",
         } for g in proxlb_data.guests.values() if g.node_current != g.node_target],
+        decommission={
+            "nodes": [{
+                "name": n.name,
+                "guests_left": sum(1 for g in proxlb_data.guests.values() if g.node_current == n.name),
+                "planned": sum(1 for g in proxlb_data.guests.values()
+                               if g.node_current == n.name and g.node_target != n.name),
+            } for n in proxlb_data.nodes.values() if n.drain],
+            "storages": [{
+                "key": s.key, "volumes_left": s.drain_volumes, "bytes_left": s.drain_bytes,
+                "blocked": s.drain_blocked,
+            } for s in storages if s.role == "drain"],
+            "max_actions_per_run": proxlb_config.decommission.max_actions_per_run,
+        },
+        exceptions={
+            "no_target_nodes": proxlb_config.proxmox_cluster.no_target_nodes,
+            "no_target_storages": proxlb_config.storage_balancing.no_target_storages,
+            "exclude_storages": proxlb_config.storage_balancing.exclude_storages,
+        },
     )
 
 
@@ -141,9 +162,11 @@ if cli_args.storage_report:
         n["node"] for n in proxmox_api.nodes.get()
         if n.get("status") == "online" and n["node"] not in proxlb_config.proxmox_cluster.ignore_nodes
     ]
-    print(Storages.format_report(Storages.get_storages(
+    _report_storages = Storages.get_storages(
         proxmox_api, _report_nodes, proxlb_config.storage_balancing,
-        proxlb_config.proxmox_api.parallel_requests)))
+        proxlb_config.proxmox_api.parallel_requests)
+    Storages.apply_roles(_report_storages, proxlb_config.storage_balancing, proxlb_config.decommission)
+    print(Storages.format_report(_report_storages))
     sys.exit(0)
 
 
@@ -218,6 +241,8 @@ while True:
         groups = Groups.get_groups(guests, nodes)
         workers = proxlb_config.proxmox_api.parallel_requests
         storage_cfg = proxlb_config.storage_balancing
+        decommission_cfg = proxlb_config.decommission
+        storage_aware = storage_cfg.enable or bool(decommission_cfg.storages)
 
         # Merge obtained objects from the Proxmox cluster for further usage
         proxlb_data = ProxLbData(
@@ -233,10 +258,11 @@ while True:
         # Storage awareness: detect full / soon full storages. The non-disruptive
         # relief (fstrim through the guest agent) runs first, then the storage
         # usage is re-read before any disk move or migration is planned.
-        if storage_cfg.enable:
+        if storage_aware:
             proxlb_data.storages = Storages.get_storages(proxmox_api, list(nodes.keys()), storage_cfg, workers)
+            Storages.apply_roles(proxlb_data.storages, storage_cfg, decommission_cfg)
             Storages.log_status(proxlb_data.storages)
-            fstrim_actions = StorageBalancing.plan_fstrim(proxlb_data)
+            fstrim_actions = StorageBalancing.plan_fstrim(proxlb_data) if storage_cfg.enable else []
             if fstrim_actions:
                 proxlb_data.storage_actions.extend(fstrim_actions)
                 if not dry_run():
@@ -260,12 +286,15 @@ while True:
         else:
             Calculations.validate_affinity_map(proxlb_data)
             Calculations.relocate_guests_on_maintenance_nodes(proxlb_data)
+            drain_migrations = Calculations.relocate_guests_on_drain_nodes(proxlb_data)
             Calculations.get_balanciness(proxlb_data)
             Calculations.relocate_guests(proxlb_data)
 
             # Storage relief: disk moves (same node) and migrations (other node).
             if storage_cfg.enable:
                 StorageBalancing.plan(proxlb_data, respect_planned_moves=proxlb_data.meta.balancing.enable)
+            if decommission_cfg.storages:
+                StorageBalancing.plan_drain(proxmox_api, proxlb_data)
 
             # CP-SAT solver (optional) — shadow (read-only) or active mode.
             _solver_cfg = proxlb_config.solver
@@ -280,12 +309,13 @@ while True:
             Helper.log_node_metrics(proxlb_data, init=False)
 
             # Storage relief first: live disk moves on the same node.
-            storage_migrations = StorageBalancing.migration_guest_names(proxlb_data)
-            if storage_cfg.enable and not dry_run():
+            storage_migrations = StorageBalancing.migration_guest_names(proxlb_data) + drain_migrations
+            if storage_aware and not dry_run():
                 StorageBalancing.execute_disk_moves(proxmox_api, proxlb_data)
-                if storage_migrations and not proxlb_data.meta.balancing.enable:
-                    # Resource balancing is off: only run the storage-driven migrations.
-                    Balancing.balance(proxmox_api, proxlb_data, guest_names=storage_migrations)
+            if storage_migrations and not dry_run() and not proxlb_data.meta.balancing.enable:
+                # Resource balancing is off: only run the storage / decommissioning migrations.
+                Balancing.balance(proxmox_api, proxlb_data, guest_names=storage_migrations)
+            if storage_aware and not dry_run():
                 if storage_migrations and proxlb_data.meta.balancing.enable and _solver_cfg.enable and _solver_cfg.mode == "active":
                     logger.warning("Storage-driven migrations are not executed while the CP-SAT solver runs in active "
                                    f"mode: {', '.join(storage_migrations)}. Disk moves were executed.")

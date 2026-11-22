@@ -376,7 +376,12 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | parallel_moves |  | 1 | `Int` | Number of concurrent disk moves (never two on the same VM). |
 |  | max_move_time |  | 7200 | `Int` | Seconds after which a disk move is reported as timed out. |
 |  | bwlimit |  |  | `Int` | Optional bandwidth limit for disk moves in KiB/s. |
-|  | exclude_storages |  | [] | `List` | Storage ids never touched by the storage balancer. |
+|  | exclude_storages |  | [] | `List` | Storages never touched by the storage balancer: `<storage>` (every node), `<node>::<storage>` or `shared::<storage>`. |
+|  | no_target_storages |  | [] | `List` | Exception: storages monitored and relieved but never a destination of a disk move / migration (same patterns). |
+| `decommission` | nodes |  | [] | `List` | Nodes to empty progressively: never a target, guests migrated away (RAM ceiling, inflow and storage checks apply). |
+|  | storages |  | [] | `List` | Storages to empty progressively: disks moved to another storage of the node, or the guest migrated with its disks. |
+|  | max_actions_per_run |  | 2 | `Int` | Migrations (nodes) and volume moves (storages) per run, each. |
+|  | include_stopped |  | True | `Bool` | Also move volumes of stopped guests and unused VM disks. |
 | `io_error_recovery` |  |  |  |  |  |
 |  | enable |  | False | `Bool` | Watchdog recovering VMs paused by an I/O error: frees space first, resumes the VM only once its storages have room again. |
 |  | interval |  | 60 | `Int` | Seconds between two watchdog scans while waiting for the next balancing run (daemon mode). |

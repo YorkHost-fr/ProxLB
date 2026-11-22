@@ -156,6 +156,9 @@ class Nodes:
             # Evaluate if node should be set to maintenance mode
             if Nodes.set_node_maintenance(proxmox_api, proxlb_config, node["node"], ha_status):
                 nodes[node["node"]].maintenance = True
+            # Decommissioning / exceptions: never a target any more.
+            nodes[node["node"]].drain = node["node"] in proxlb_config.decommission.nodes
+            nodes[node["node"]].no_target = node["node"] in proxlb_config.proxmox_cluster.no_target_nodes
 
         logger.debug(f"Node metrics collected: {nodes}")
         logger.debug("Finished: get_nodes.")

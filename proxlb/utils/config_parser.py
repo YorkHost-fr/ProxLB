@@ -76,6 +76,9 @@ class Config(BaseModel):
 
         ignore_nodes: list[str] = []
         maintenance_nodes: list[str] = []
+        # Exception: these nodes never receive guests (balancing, storage
+        # relief, decommissioning), their own guests are still balanced away.
+        no_target_nodes: list[str] = []
         maintenance_nodes_schedule: MaintenanceNodesSchedule = Field(default_factory=MaintenanceNodesSchedule)
         overprovisioning: bool = False
 
@@ -318,7 +321,13 @@ class Config(BaseModel):
         max_move_time: int = Field(default=7200, ge=60)
         # Optional bandwidth limit for disk moves in KiB/s (Proxmox 'bwlimit').
         bwlimit: Optional[int] = Field(default=None, ge=1)
+        # Storages are given as '<storage>' (every node) or '<node>::<storage>'
+        # ('shared::<storage>' for a shared storage).
+        # Fully ignored: never relieved, never a destination.
         exclude_storages: list[str] = []
+        # Exception: monitored and relieved, but never a destination of a disk
+        # move or migration (e.g. a node's 'local' that must not host VMs).
+        no_target_storages: list[str] = []
         # Before moving any data, ask the QEMU guest agent to run fstrim on VMs
         # whose disks on the full storage have 'discard=on'. This hands freed
         # blocks back to thin pools (lvmthin, zfs, ceph, qcow2...) without any
@@ -338,6 +347,24 @@ class Config(BaseModel):
                 if self.target_free_gib is not None and self.target_free_gib <= self.critical_free_gib:
                     raise ValueError("storage_balancing.target_free_gib must be > critical_free_gib")
             return self
+
+    class Decommission(BaseModel):
+        """
+        Progressive decommissioning: the listed nodes / storages never receive
+        anything any more and are emptied a few guests / disks per run, with
+        the same guard rails as balancing (RAM ceiling, node inflow, room on
+        the destination storage).
+        """
+        # Nodes to empty: their guests are migrated away.
+        nodes: list[str] = []
+        # Storages to empty ('<storage>', '<node>::<storage>' or
+        # 'shared::<storage>'): disks are moved to another storage of the same
+        # node, or the guest is migrated with its disks.
+        storages: list[str] = []
+        # Migrations (nodes) and disk moves (storages) per run, each.
+        max_actions_per_run: int = Field(default=2, ge=1)
+        # Also move the disks of stopped VMs / containers and unused VM disks.
+        include_stopped: bool = True
 
     class IoErrorRecovery(BaseModel):
         """
@@ -397,6 +424,7 @@ class Config(BaseModel):
     service: Service = Field(default_factory=Service)
     solver: Solver = Field(default_factory=Solver)
     storage_balancing: StorageBalancing = Field(default_factory=StorageBalancing)
+    decommission: Decommission = Field(default_factory=Decommission)
     io_error_recovery: IoErrorRecovery = Field(default_factory=IoErrorRecovery)
 
     @model_validator(mode="after")

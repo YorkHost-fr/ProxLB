@@ -14,6 +14,8 @@ proxmox_api:
 
 proxmox_cluster:
   maintenance_nodes: ['virt66.example.com']
+  # Exception: nodes that never receive guests (still balanced away from).
+  no_target_nodes: []
   maintenance_nodes_schedule:
     duration: 3                       # Duration in hours after the configured schedule start
     pre-migration: 10                 # Start maintenance this many minutes before the configured schedule
@@ -130,10 +132,20 @@ storage_balancing:
   max_actions_per_run: 5
   parallel_moves: 1
   # bwlimit: 102400                   # Optional disk move bandwidth limit in KiB/s
-  exclude_storages: []
+  # '<storage>' (every node), '<node>::<storage>' or 'shared::<storage>'.
+  exclude_storages: []      # fully ignored
+  no_target_storages: []    # monitored / relieved, but never a destination
 
 # Automatic recovery of VMs paused by an I/O error (e.g. full thin pool).
 # Space is freed first; a VM is only resumed once its storages have room again.
+# Progressive decommissioning: never a target any more, emptied a few
+# guests / volumes per run with the balancing guard rails.
+decommission:
+  nodes: []                 # guests migrated away
+  storages: []              # disks moved (same node) or guest migrated with its disks
+  max_actions_per_run: 2
+  include_stopped: True     # also stopped guests and unused VM disks
+
 io_error_recovery:
   enable: True
   interval: 60                        # Watchdog interval (seconds) between balancing runs

@@ -251,6 +251,15 @@ class Calculations:
                 sys.exit(1)
 
             method_value_highest = max(method_value)
+            # Only nodes that may receive guests count as the low end: an empty
+            # node being decommissioned (or excluded as a target) must not keep
+            # the cluster "unbalanced" forever.
+            receiving = [n for n in proxlb_data.nodes.values() if n.accepts_guests()]
+            if receiving and len(receiving) < len(proxlb_data.nodes):
+                if mode == BalancingMode.Assigned:
+                    method_value = [n.metric(method).assigned_percent for n in receiving]
+                else:
+                    method_value = [n.metric(method).used_percent for n in receiving]
             method_value_lowest = min(method_value)
 
             if method_value_highest - method_value_lowest > balanciness:
@@ -292,12 +301,12 @@ class Calculations:
             filtered_nodes = [
                 node
                 for node in proxlb_data.nodes.values()
-                if node.name in guest_node_relation_list and not node.maintenance
+                if node.name in guest_node_relation_list and node.accepts_guests()
             ]
         else:
             # Filter and exclude nodes only that are in maintenance mode
             filtered_nodes = [
-                node for node in proxlb_data.nodes.values() if not node.maintenance
+                node for node in proxlb_data.nodes.values() if node.accepts_guests()
             ]
 
         # max_node_inflow: a node that already receives that many guests in this
@@ -387,7 +396,8 @@ class Calculations:
             # not in a maintenance
             proxlb_data.meta.balancing.balance_next_guest = guest_name
             if Calculations.get_most_free_node(proxlb_data, ignore_inflow=True):
-                Calculations.update_node_resources(proxlb_data)
+                if Calculations.update_node_resources(proxlb_data):
+                    proxlb_data.guests[guest_name].move_reason = "maintenance"
             else:
                 logger.warning(f"Warning: Could not find a suitable node to relocate guest {guest_name} from a maintenance node.")
             logger.warning(f"Warning: Balancing may not be perfect because guest {guest_name} was located on a node which is in maintenance mode.")
@@ -473,6 +483,10 @@ class Calculations:
 
                 for guest_name in proxlb_data.groups.affinity[group_name].guests:
 
+                    # Already planned in this run (maintenance, decommissioning).
+                    if proxlb_data.guests[guest_name].node_target != proxlb_data.guests[guest_name].node_current:
+                        continue
+
                     # Stop moving guests if the source node is no longer the most loaded
                     source_node = proxlb_data.guests[guest_name].node_current
                     method = proxlb_data.meta.balancing.method
@@ -518,13 +532,66 @@ class Calculations:
 
                     Calculations.val_anti_affinity(proxlb_data, guest_name)
                     Calculations.val_node_relationships(proxlb_data, guest_name)
-                    if not Calculations.update_node_resources(proxlb_data):
-                        Calculations.place_on_next_node(proxlb_data, guest_name)
+                    if Calculations.update_node_resources(proxlb_data) or Calculations.place_on_next_node(proxlb_data, guest_name):
+                        guest = proxlb_data.guests[guest_name]
+                        if guest.node_target != guest.node_current and not guest.move_reason:
+                            guest.move_reason = "balancing"
 
         logger.debug("Finished: relocate_guests.")
 
     @staticmethod
-    def place_on_next_node(proxlb_data: ProxLbData, guest_name: str) -> bool:
+    def relocate_guests_on_drain_nodes(proxlb_data: ProxLbData) -> list[str]:
+        """
+        Decommissioning of nodes (decommission.nodes): migrate a few guests per
+        run (decommission.max_actions_per_run) away from the nodes being
+        emptied, smallest first, with the balancing guard rails (RAM ceiling,
+        node inflow, room for the local disks) but without the ping-pong guard.
+
+        Returns:
+            list[str]: The guests planned for a migration.
+        """
+        balancing = proxlb_data.meta.balancing
+        limit = proxlb_data.meta.decommission.max_actions_per_run
+        drain_nodes = {n.name for n in proxlb_data.nodes.values() if n.drain}
+        planned: list[str] = []
+        if not drain_nodes:
+            return planned
+
+        movable = sorted(
+            (g for g in proxlb_data.guests.values()
+             if g.node_current in drain_nodes and g.node_target == g.node_current),
+            key=lambda g: g.memory.used,
+        )
+        for guest in movable:
+            if len(planned) >= limit:
+                break
+            if guest.ignore or guest.lock or guest.type not in balancing.balance_types:
+                continue
+            balancing.balance_next_guest = guest.name
+            Calculations.get_most_free_node(proxlb_data)
+            placed = False
+            if (balancing.balance_next_node is not None
+                    and Calculations.validate_node_resources(proxlb_data, guest.name)
+                    and Calculations.validate_balancing_move(proxlb_data, guest.name, evacuation=True)):
+                Calculations.val_anti_affinity(proxlb_data, guest.name)
+                Calculations.val_node_relationships(proxlb_data, guest.name)
+                placed = Calculations.update_node_resources(proxlb_data)
+            if not placed:
+                placed = Calculations.place_on_next_node(proxlb_data, guest.name, evacuation=True)
+            if placed and guest.node_target != guest.node_current:
+                guest.move_reason = "drain"
+                planned.append(guest.name)
+                logger.info(f"Decommission: {guest.name} planned from {guest.node_current} to {guest.node_target}.")
+            else:
+                logger.info(f"Decommission: no node can take {guest.name} from {guest.node_current} in this run "
+                            "(RAM ceiling, node inflow or storage room).")
+
+        left = sum(1 for g in proxlb_data.guests.values() if g.node_current in drain_nodes) - len(planned)
+        logger.info(f"Decommission: {left} guest(s) left on {', '.join(sorted(drain_nodes))} after this run.")
+        return planned
+
+    @staticmethod
+    def place_on_next_node(proxlb_data: ProxLbData, guest_name: str, evacuation: bool = False) -> bool:
         """
         The preferred target was refused (typically: its storages cannot take the
         guest's local disks). Try the other nodes, most free first, with the same
@@ -549,7 +616,7 @@ class Calculations:
 
         candidates = sorted(
             (n for n in proxlb_data.nodes.values()
-             if n.name not in tried and not n.maintenance and n.name not in blocked
+             if n.name not in tried and n.accepts_guests() and n.name not in blocked
              and (not guest.node_relationships or n.name in guest.node_relationships)
              and (not balancing.max_node_inflow or balancing.node_inflow.get(n.name, 0) < balancing.max_node_inflow)),
             key=load,
@@ -558,7 +625,7 @@ class Calculations:
             balancing.balance_next_node = node.name
             if not Calculations.validate_node_resources(proxlb_data, guest_name, node.name):
                 continue
-            if not Calculations.validate_balancing_move(proxlb_data, guest_name):
+            if not Calculations.validate_balancing_move(proxlb_data, guest_name, evacuation):
                 continue
             if Calculations.update_node_resources(proxlb_data):
                 logger.info(f"{guest_name}: planned on {node.name} instead (the preferred target could not take it).")
@@ -669,7 +736,7 @@ class Calculations:
                 node_name
                 for node_name, node_meta in proxlb_data.nodes.items()
                 if node_name not in blocked_nodes
-                and not node_meta.maintenance
+                and (node_meta.accepts_guests() or node_name == node_current)
                 and (node_name == node_current or Calculations.validate_node_resources(proxlb_data, guest_name, node_name))
             ]
 
@@ -972,7 +1039,7 @@ class Calculations:
         return True
 
     @staticmethod
-    def validate_balancing_move(proxlb_data: ProxLbData, guest_name: str) -> bool:
+    def validate_balancing_move(proxlb_data: ProxLbData, guest_name: str, evacuation: bool = False) -> bool:
         """
         Guard rails of a balancing move (not applied to maintenance evacuations):
 
@@ -1006,7 +1073,8 @@ class Calculations:
             or (balancing.enforce_pinning and bool(guest.node_relationships)
                 and guest.node_current not in guest.node_relationships)
         )
-        if balancing.mode in (BalancingMode.Used, BalancingMode.Assigned) and not fixes_rule:
+        # Evacuations (decommissioning) must leave the node whatever the load.
+        if balancing.mode in (BalancingMode.Used, BalancingMode.Assigned) and not fixes_rule and not evacuation:
             method = balancing.method
             t, s, g = target.metric(method), source.metric(method), guest.metric(method)
             if balancing.mode == BalancingMode.Used:
