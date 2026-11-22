@@ -339,7 +339,8 @@ class Storages:
         if storage.used_percent >= config.critical_percent or metadata >= config.critical_percent:
             storage.status = "critical"
         elif (config.forecast and storage.days_until_critical is not None
-              and storage.days_until_critical <= config.forecast_days):
+              and storage.days_until_critical <= config.forecast_days
+              and max(storage.used_percent, metadata) >= config.forecast_min_percent):
             storage.status = "forecast"
         elif storage.used_percent >= config.warning_percent or metadata >= config.warning_percent:
             storage.status = "warning"

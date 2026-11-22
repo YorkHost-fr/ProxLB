@@ -114,6 +114,7 @@ storage_balancing:
   target_max_percent: 75              # Aim for this level; never fill a destination above it
   forecast: True                      # Also act on storages forecast to hit critical_percent...
   forecast_days: 7                    # ...within this many days
+  forecast_min_percent: 70            # ...but only once a storage is at least this full
   forecast_timeframe: week            # RRD history used for the trend: hour | day | week | month | year
   strategy: disk_move_first           # disk_move_first | migrate_first
   allow_disk_move: True               # VMs only (Proxmox can't move volumes of running CTs)
