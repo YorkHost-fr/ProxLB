@@ -47,6 +47,8 @@ balancing:
   target_storage_min_free_gib: 0      # Absolute safety margin floor in GiB (effective margin = max of both)
   cpu_overcommit: 2.0                 # Maximum ratio of vCPUs to physical cores per node
   max_node_inflow: 1                  # Maximum number of VMs that may be migrated onto any single node per run
+  # max_migrations_per_run: 4         # Optional: cap of migrations planned per run (the rest waits for the next run)
+  # memory_target_max_percent: 93     # Optional: target node RAM ceiling after a move (swap / KSM headroom)
   balance_types: ['vm', 'ct']         # 'vm' | 'ct'
   max_job_validation: 1800            # Maximum time (in seconds) a job validation may take
   memory_threshold: 75                # Optional: Maximum threshold (in percent) to trigger balancing actions
@@ -112,6 +114,10 @@ storage_balancing:
   warning_percent: 80                 # Report storages above this fill level
   critical_percent: 90                # Act on storages above this fill level
   target_max_percent: 75              # Aim for this level; never fill a destination above it
+  # Optional thresholds in free GiB (the smaller free space of % and GiB applies):
+  # warning_free_gib: 200
+  # critical_free_gib: 100
+  # target_free_gib: 300
   forecast: True                      # Also act on storages forecast to hit critical_percent...
   forecast_days: 7                    # ...within this many days
   forecast_min_percent: 70            # ...but only once a storage is at least this full

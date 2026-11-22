@@ -7,3 +7,7 @@ changed:
 - Monitor LVM thin pool metadata usage and report inactive storages (@yorkhost-fr). [#0]
 - Back off emergency runs requested by the io-error watchdog when nothing can be freed (@yorkhost-fr). [#0]
 - Only forecast storages already filled above storage_balancing.forecast_min_percent (default 70) (@yorkhost-fr). [#0]
+- Enforce balancing.max_node_inflow in the greedy balancer and add max_migrations_per_run, memory_target_max_percent and a ping-pong guard (@yorkhost-fr). [#0]
+- Make resource balancing storage aware: a guest is only planned onto a node whose storage can take its local disks, falling back to the next node (@yorkhost-fr). [#0]
+- Add storage thresholds in free GiB (warning/critical/target_free_gib) (@yorkhost-fr). [#0]
+- Skip the per-guest RRD history when the configuration does not use it (proxmox_api.guest_rrd) (@yorkhost-fr). [#0]

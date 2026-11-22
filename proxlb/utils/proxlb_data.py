@@ -26,6 +26,10 @@ class ProxLbData(BaseModel):
             # completes, so concurrent migrations targeting the same node-local
             # storage do not collectively overcommit it. Not read from config.
             storage_reservations: dict[str, tuple[str, int]] = {}
+            # Runtime-only: guests planned onto each node and migrations planned
+            # in this run (max_node_inflow / max_migrations_per_run).
+            node_inflow: dict[str, int] = {}
+            planned_migrations: int = 0
 
         balancing: Balancing = Balancing()  # pyright: ignore [reportIncompatibleVariableOverride]
         cluster_non_pve9: bool

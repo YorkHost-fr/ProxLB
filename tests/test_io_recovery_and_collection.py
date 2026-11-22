@@ -135,7 +135,7 @@ class _FakeApi:
 
 def test_collection_end_to_end_uses_few_requests() -> None:
     api = _FakeApi()
-    cfg = Config(proxmox_api=Config.ProxmoxAPI(hosts=["h"], user="u"))
+    cfg = Config(proxmox_api=Config.ProxmoxAPI(hosts=["h"], user="u", guest_rrd="always"))
     nodes = Nodes.get_nodes(api, cfg)  # type: ignore[arg-type]
     assert nodes["pve1"].cpu.pressure_some_percent == 1.0
     node_calls = len(api.calls)
@@ -152,3 +152,23 @@ def test_collection_end_to_end_uses_few_requests() -> None:
     # 2 listings + 3 requests per running guest (config, rrd avg, rrd max)
     assert len(api.calls) - node_calls == 2 + 3 * 2
     assert any(c.endswith("/lxc/101/rrddata") for c in api.calls)
+
+
+def test_guest_rrd_skipped_when_unused() -> None:
+    """memory method / used mode / no solver: the guest RRD history is not used."""
+    api = _FakeApi()
+    cfg = Config(proxmox_api=Config.ProxmoxAPI(hosts=["h"], user="u"))
+    assert Guests.needs_rrd(cfg) is False
+    nodes = Nodes.get_nodes(api, cfg)  # type: ignore[arg-type]
+    before = len(api.calls)
+    guests = Guests.get_guests(api, {}, {}, nodes, cfg)  # type: ignore[arg-type]
+    # 2 listings + 1 config per running guest
+    assert len(api.calls) - before == 2 + 1 * 2
+    assert not any("/qemu/100/rrddata" in c or "/lxc/101/rrddata" in c for c in api.calls)
+    assert guests["vm100"].memory.used == 2 * GIB
+
+    for method, extra in (("cpu", {}), ("memory", {"solver": {"enable": True}}), ("memory", {"balancing": {"mode": "psi"}})):
+        data: dict[str, Any] = {"proxmox_api": {"hosts": ["h"], "user": "u"}, "balancing": {"method": method}}
+        for key, value in extra.items():
+            data.setdefault(key, {}).update(value)
+        assert Guests.needs_rrd(Config(**data)) is True, (method, extra)
