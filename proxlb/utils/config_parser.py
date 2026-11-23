@@ -17,7 +17,7 @@ try:
 except ImportError:
     PYYAML_PRESENT = False
 from enum import StrEnum
-from typing import Any, Optional, assert_never
+from typing import Any, Optional
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 from pathlib import Path
 from proxlb.utils.logger import SystemdLogger
@@ -72,10 +72,24 @@ class Config(BaseModel):
             pre_migration: int = Field(default=0, alias="pre-migration", ge=0)
             schedules: dict[str, list[str]] = Field(default_factory=dict)
 
+        class CpuVendor(StrEnum):
+            Intel = "intel"
+            Amd = "amd"
+
         _maintenance_nodes_static: list[str] = PrivateAttr(default_factory=list)
+        # Online nodes of another CPU vendor (cpu_vendor), found at run time.
+        _auto_ignored: set[str] = PrivateAttr(default_factory=set)
 
         ignore_nodes: list[str] = []
+        # Only manage the nodes whose CPU is of this vendor (read from the
+        # Proxmox API): a new node is picked up by the right instance without
+        # editing ignore_nodes (live migration between Intel and AMD fails).
+        # Nodes with an unknown CPU are ignored. None = every node.
+        cpu_vendor: Optional[CpuVendor] = None
         maintenance_nodes: list[str] = []
+        # Exception: these nodes never receive guests (balancing, storage
+        # relief, decommissioning), their own guests are still balanced away.
+        no_target_nodes: list[str] = []
         maintenance_nodes_schedule: MaintenanceNodesSchedule = Field(default_factory=MaintenanceNodesSchedule)
         overprovisioning: bool = False
 
@@ -84,6 +98,13 @@ class Config(BaseModel):
 
         def static_maintenance_nodes(self) -> list[str]:
             return list(self._maintenance_nodes_static)
+
+        def ignored_nodes(self) -> set[str]:
+            """ignore_nodes plus the nodes of another CPU vendor."""
+            return set(self.ignore_nodes) | self._auto_ignored
+
+        def set_auto_ignored(self, nodes: set[str]) -> None:
+            self._auto_ignored = set(nodes)
 
     class Balancing(BaseModel):
         class Resource(StrEnum):
@@ -210,8 +231,7 @@ class Config(BaseModel):
                 return self.disk_threshold
             elif method == self.Resource.Memory:
                 return self.memory_threshold
-            else:
-                assert_never(method)
+            raise ValueError(f"unexpected base resource: {method}")
 
     class Service(BaseModel):
 
@@ -318,7 +338,13 @@ class Config(BaseModel):
         max_move_time: int = Field(default=7200, ge=60)
         # Optional bandwidth limit for disk moves in KiB/s (Proxmox 'bwlimit').
         bwlimit: Optional[int] = Field(default=None, ge=1)
+        # Storages are given as '<storage>' (every node) or '<node>::<storage>'
+        # ('shared::<storage>' for a shared storage).
+        # Fully ignored: never relieved, never a destination.
         exclude_storages: list[str] = []
+        # Exception: monitored and relieved, but never a destination of a disk
+        # move or migration (e.g. a node's 'local' that must not host VMs).
+        no_target_storages: list[str] = []
         # Before moving any data, ask the QEMU guest agent to run fstrim on VMs
         # whose disks on the full storage have 'discard=on'. This hands freed
         # blocks back to thin pools (lvmthin, zfs, ceph, qcow2...) without any
@@ -338,6 +364,24 @@ class Config(BaseModel):
                 if self.target_free_gib is not None and self.target_free_gib <= self.critical_free_gib:
                     raise ValueError("storage_balancing.target_free_gib must be > critical_free_gib")
             return self
+
+    class Decommission(BaseModel):
+        """
+        Progressive decommissioning: the listed nodes / storages never receive
+        anything any more and are emptied a few guests / disks per run, with
+        the same guard rails as balancing (RAM ceiling, node inflow, room on
+        the destination storage).
+        """
+        # Nodes to empty: their guests are migrated away.
+        nodes: list[str] = []
+        # Storages to empty ('<storage>', '<node>::<storage>' or
+        # 'shared::<storage>'): disks are moved to another storage of the same
+        # node, or the guest is migrated with its disks.
+        storages: list[str] = []
+        # Migrations (nodes) and disk moves (storages) per run, each.
+        max_actions_per_run: int = Field(default=2, ge=1)
+        # Also move the disks of stopped VMs / containers and unused VM disks.
+        include_stopped: bool = True
 
     class IoErrorRecovery(BaseModel):
         """
@@ -397,6 +441,7 @@ class Config(BaseModel):
     service: Service = Field(default_factory=Service)
     solver: Solver = Field(default_factory=Solver)
     storage_balancing: StorageBalancing = Field(default_factory=StorageBalancing)
+    decommission: Decommission = Field(default_factory=Decommission)
     io_error_recovery: IoErrorRecovery = Field(default_factory=IoErrorRecovery)
 
     @model_validator(mode="after")
@@ -469,6 +514,13 @@ class ConfigParser:
         "PROXLB_API_TOKEN_SECRET": "token_secret",
     }
 
+    # Comma separated entries added to a list of the configuration file.
+    ENV_LIST_ADDITIONS = {
+        "PROXLB_IGNORE_NODES": ("proxmox_cluster", "ignore_nodes"),
+        "PROXLB_NO_TARGET_NODES": ("proxmox_cluster", "no_target_nodes"),
+        "PROXLB_NO_TARGET_STORAGES": ("storage_balancing", "no_target_storages"),
+    }
+
     @staticmethod
     def read_env_file(path: str) -> dict[str, str]:
         """
@@ -531,6 +583,23 @@ class ConfigParser:
             logger.debug(f"proxmox_api.{key} set from environment variable {variable}.")
         if api:
             data["proxmox_api"] = api
+        # Instance identity set by the deployment (e.g. Kubernetes): CPU vendor
+        # and list entries added to the configuration file's lists.
+        vendor = env.get("PROXLB_CPU_VENDOR", "").strip().lower()
+        if vendor:
+            cluster = dict(data.get("proxmox_cluster") or {})
+            cluster["cpu_vendor"] = vendor
+            data["proxmox_cluster"] = cluster
+            logger.debug("proxmox_cluster.cpu_vendor set from environment variable PROXLB_CPU_VENDOR.")
+        for variable, (section, key) in ConfigParser.ENV_LIST_ADDITIONS.items():
+            items = [v.strip() for v in env.get(variable, "").split(",") if v.strip()]
+            if not items:
+                continue
+            part = dict(data.get(section) or {})
+            current = list(part.get(key) or [])
+            part[key] = current + [v for v in items if v not in current]
+            data[section] = part
+            logger.debug(f"{section}.{key}: {', '.join(items)} added from environment variable {variable}.")
         return data
 
     @staticmethod

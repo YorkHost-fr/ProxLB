@@ -355,6 +355,8 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 | *Environment* | `PROXLB_ENV_FILE` |  | /secrets/.env | `Str` | Optional dotenv file read for the `PROXLB_*` variables below (real environment variables win). |
+|  | `PROXLB_CPU_VENDOR` |  |  | `Str` | Sets `proxmox_cluster.cpu_vendor` (instance identity set by the deployment). |
+|  | `PROXLB_IGNORE_NODES` / `PROXLB_NO_TARGET_NODES` / `PROXLB_NO_TARGET_STORAGES` |  |  | `Str` | Comma separated entries added to the matching lists of the configuration file. |
 |  | `PROXLB_API_HOSTS` / `PROXLB_API_USER` / `PROXLB_API_PASS` / `PROXLB_API_TOKEN_ID` / `PROXLB_API_TOKEN_SECRET` |  |  | `Str` | Override the `proxmox_api` hosts (comma separated) and credentials, so secrets stay out of the config file. |
 |  | `PROXLB_CONTROL_TOKEN` |  |  | `Str` | Bearer token of the control endpoint. |
 | `storage_balancing` |  |  |  |  |  |
@@ -376,7 +378,13 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | parallel_moves |  | 1 | `Int` | Number of concurrent disk moves (never two on the same VM). |
 |  | max_move_time |  | 7200 | `Int` | Seconds after which a disk move is reported as timed out. |
 |  | bwlimit |  |  | `Int` | Optional bandwidth limit for disk moves in KiB/s. |
-|  | exclude_storages |  | [] | `List` | Storage ids never touched by the storage balancer. |
+|  | exclude_storages |  | [] | `List` | Storages never touched by the storage balancer: `<storage>` (every node), `<node>::<storage>` or `shared::<storage>`. |
+| `proxmox_cluster` | cpu_vendor |  | None | `Str` | `intel` or `amd`: only manage the nodes whose CPU (Proxmox API) is of this vendor. New nodes are picked up automatically, nodes with an unknown CPU are ignored. Run one instance per vendor (live migration between Intel and AMD fails). |
+|  | no_target_storages |  | [] | `List` | Exception: storages monitored and relieved but never a destination of a disk move / migration (same patterns). |
+| `decommission` | nodes |  | [] | `List` | Nodes to empty progressively: never a target, guests migrated away (RAM ceiling, inflow and storage checks apply). |
+|  | storages |  | [] | `List` | Storages to empty progressively: disks moved to another storage of the node, or the guest migrated with its disks. |
+|  | max_actions_per_run |  | 2 | `Int` | Migrations (nodes) and volume moves (storages) per run, each. |
+|  | include_stopped |  | True | `Bool` | Also move volumes of stopped guests and unused VM disks. |
 | `io_error_recovery` |  |  |  |  |  |
 |  | enable |  | False | `Bool` | Watchdog recovering VMs paused by an I/O error: frees space first, resumes the VM only once its storages have room again. |
 |  | interval |  | 60 | `Int` | Seconds between two watchdog scans while waiting for the next balancing run (daemon mode). |

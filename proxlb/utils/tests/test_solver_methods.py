@@ -55,7 +55,7 @@ def _node() -> ProxLbData.Node:
     (Resource.IoSmart, Resource.Disk),
     (Resource.IoPsi, Resource.Disk),
 ])
-def test_base_resource_mapping(method, expected) -> None:
+def test_base_resource_mapping(method: Resource, expected: Resource) -> None:
     assert Config.Balancing.base_resource(method) == expected
 
 
@@ -74,7 +74,7 @@ def test_node_metric_resolves_solver_methods() -> None:
 
 def test_threshold_resolves_solver_methods() -> None:
     """threshold() must map solver-only methods to the matching base threshold."""
-    bal = Config.Balancing(method="global_smart", memory_threshold=80, cpu_threshold=70)
+    bal = Config.Balancing(method=Resource.GlobalSmart, memory_threshold=80, cpu_threshold=70)
     assert bal.threshold(Resource.GlobalSmart) == 80   # -> memory
     assert bal.threshold(Resource.CpuPsi) == 70        # -> cpu
 
@@ -82,20 +82,20 @@ def test_threshold_resolves_solver_methods() -> None:
 def test_solver_method_rejected_without_solver() -> None:
     """A solver-only method must be rejected when solver.enable is False."""
     with pytest.raises(ValidationError):
-        Config(proxmox_api={"hosts": ["h"], "user": "u"},
-               balancing={"method": "global_smart"})
+        Config.model_validate({"proxmox_api": {"hosts": ["h"], "user": "u"},
+                               "balancing": {"method": "global_smart"}})
 
 
 def test_solver_method_accepted_with_solver() -> None:
     """A solver-only method is accepted when the solver is enabled."""
-    cfg = Config(proxmox_api={"hosts": ["h"], "user": "u"},
-                 balancing={"method": "global_smart"},
-                 solver={"enable": True})
+    cfg = Config.model_validate({"proxmox_api": {"hosts": ["h"], "user": "u"},
+                                 "balancing": {"method": "global_smart"},
+                                 "solver": {"enable": True}})
     assert cfg.balancing.method == Resource.GlobalSmart
 
 
 def test_base_method_unaffected_by_guard() -> None:
     """Base resources never require the solver."""
-    cfg = Config(proxmox_api={"hosts": ["h"], "user": "u"},
-                 balancing={"method": "memory"})
+    cfg = Config.model_validate({"proxmox_api": {"hosts": ["h"], "user": "u"},
+                                 "balancing": {"method": "memory"}})
     assert cfg.balancing.method == Resource.Memory

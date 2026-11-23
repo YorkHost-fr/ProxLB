@@ -23,6 +23,7 @@ __license__ = "GPL-3.0"
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from proxlb.utils.config_parser import Config
+from proxlb.utils.control import ControlState
 from proxlb.utils.helper import Helper
 from proxlb.utils.logger import SystemdLogger
 from proxlb.utils.proxlb_data import ProxLbData
@@ -42,6 +43,87 @@ class Nodes:
     The Nodes class retrieves all running nodes in a Proxmox cluster
     and collects their resource metrics.
     """
+    # CPU model of each node (read once: it does not change while ProxLB runs).
+    cpu_models: Dict[str, str] = {}
+    # Nodes managed by this instance so far (None before the first run).
+    known_managed: Optional[set[str]] = None
+    # Nodes already reported with an unknown CPU.
+    reported_unknown: set[str] = set()
+
+    @staticmethod
+    def cpu_vendor_of(model: str) -> str:
+        """'intel', 'amd' or '' from a CPU model string."""
+        text = model.lower()
+        if "intel" in text or "xeon" in text:
+            return "intel"
+        if "amd" in text or "ryzen" in text or "epyc" in text:
+            return "amd"
+        return ""
+
+    @staticmethod
+    def detect_cpu_vendors(proxmox_api: ProxmoxApi, proxlb_config: Config) -> dict[str, Any]:
+        """
+        proxmox_cluster.cpu_vendor: read the CPU model of the online nodes and
+        ignore the ones of another vendor (or of an unknown one). A node that
+        becomes managed is reported once (control endpoint event 'node').
+
+        Returns:
+            dict: cpu_vendor, managed nodes and other nodes with their CPU model.
+        """
+        cluster = proxlb_config.proxmox_cluster
+        if cluster.cpu_vendor is None:
+            cluster.set_auto_ignored(set())
+            return {}
+        online = [n["node"] for n in proxmox_api.nodes.get() if n.get("status") == "online"]
+        missing = [n for n in online if not Nodes.cpu_models.get(n)]
+
+        def model(node: str) -> str:
+            try:
+                return str(proxmox_api.nodes(node).status.get().get("cpuinfo", {}).get("model", ""))
+            except Exception as exc:
+                logger.warning(f"Node: could not read the CPU model of {node}: {exc}")
+                return ""
+
+        for node, cpu in zip(missing, Helper.parallel_map(model, missing, proxlb_config.proxmox_api.parallel_requests)):
+            if cpu:
+                Nodes.cpu_models[node] = cpu
+
+        wanted = str(cluster.cpu_vendor)
+        vendor = {n: Nodes.cpu_vendor_of(Nodes.cpu_models.get(n, "")) for n in online}
+        others = {n for n in online if vendor[n] != wanted}
+        cluster.set_auto_ignored(others)
+        managed = {n for n in online if vendor[n] == wanted} - set(cluster.ignore_nodes)
+
+        for node in sorted(n for n in online if not vendor[n] and n not in Nodes.reported_unknown):
+            Nodes.reported_unknown.add(node)
+            logger.warning(f"Node: {node} has an unknown CPU ({Nodes.cpu_models.get(node) or 'not readable'}): ignored.")
+            ControlState.event("node", f"Node {node}: CPU model unknown ({Nodes.cpu_models.get(node) or 'not readable'}), "
+                                       "not managed by any instance.", status="unknown_cpu", node=node)
+        if Nodes.known_managed is not None:
+            for node in sorted(managed - Nodes.known_managed):
+                logger.info(f"Node: new {wanted} node {node} detected ({Nodes.cpu_models.get(node)}): now managed.")
+                ControlState.event("node", f"New {wanted} node {node} detected ({Nodes.cpu_models.get(node)}): "
+                                           "now managed by this instance.", status="new_node", node=node)
+            Nodes.known_managed |= managed
+        else:
+            Nodes.known_managed = set(managed)
+        return {
+            "cpu_vendor": wanted,
+            "managed": sorted(managed),
+            "others": {n: Nodes.cpu_models.get(n, "") for n in sorted(others)},
+        }
+
+    @staticmethod
+    def is_managed(proxlb_config: Config, node_name: str) -> bool:
+        """Managed by this instance: not ignored and of the right CPU vendor
+        (a node never seen by a run yet is not managed)."""
+        cluster = proxlb_config.proxmox_cluster
+        if node_name in cluster.ignored_nodes():
+            return False
+        if cluster.cpu_vendor is None:
+            return True
+        return Nodes.cpu_vendor_of(Nodes.cpu_models.get(node_name, "")) == str(cluster.cpu_vendor)
+
     def __init__(self) -> None:
         """
         Initializes the Nodes class with the provided ProxLB data.
@@ -156,6 +238,9 @@ class Nodes:
             # Evaluate if node should be set to maintenance mode
             if Nodes.set_node_maintenance(proxmox_api, proxlb_config, node["node"], ha_status):
                 nodes[node["node"]].maintenance = True
+            # Decommissioning / exceptions: never a target any more.
+            nodes[node["node"]].drain = node["node"] in proxlb_config.decommission.nodes
+            nodes[node["node"]].no_target = node["node"] in proxlb_config.proxmox_cluster.no_target_nodes
 
         logger.debug(f"Node metrics collected: {nodes}")
         logger.debug("Finished: get_nodes.")
@@ -224,6 +309,9 @@ class Nodes:
 
         if node_name in proxlb_config.proxmox_cluster.ignore_nodes:
             logger.info(f"Node: {node_name} has been set to be ignored. Not adding node!")
+            return True
+        if node_name in proxlb_config.proxmox_cluster.ignored_nodes():
+            logger.debug(f"Node: {node_name} has another CPU vendor than {proxlb_config.proxmox_cluster.cpu_vendor}. Not adding node!")
             return True
 
         logger.debug("Finished: set_node_ignore.")

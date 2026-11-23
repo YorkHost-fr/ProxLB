@@ -91,8 +91,9 @@ class IoRecovery:
         workers = proxlb_config.proxmox_api.parallel_requests
         wanted = {"io-error"} | ({"paused"} if cfg.resume_paused else set())
 
-        ignored = set(proxlb_config.proxmox_cluster.ignore_nodes)
-        nodes = [n["node"] for n in proxmox_api.nodes.get() if n.get("status") == "online" and n["node"] not in ignored]
+        from proxlb.models.nodes import Nodes  # local import: avoid import cycle
+        nodes = [n["node"] for n in proxmox_api.nodes.get()
+                 if n.get("status") == "online" and Nodes.is_managed(proxlb_config, n["node"])]
 
         def list_vms(node: str) -> list[tuple[str, dict[str, Any]]]:
             try:

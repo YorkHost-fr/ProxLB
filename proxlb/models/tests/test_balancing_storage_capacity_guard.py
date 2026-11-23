@@ -14,6 +14,7 @@ __license__ = "GPL-3.0"
 
 
 from types import SimpleNamespace
+from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,9 +25,9 @@ from proxlb.models.balancing import Balancing, InsufficientTargetStorageError
 GIB = 1024 ** 3
 
 
-def _balancing(capacity_guard=True, min_free_percent=10.0, min_free_gib=0,
-               target_storage_auto=True, target_storage_map=None,
-               reservations=None):
+def _balancing(capacity_guard: bool = True, min_free_percent: float = 10.0, min_free_gib: int = 0,
+               target_storage_auto: bool = True, target_storage_map: Optional[dict[str, str]] = None,
+               reservations: Optional[dict[str, tuple[str, int]]] = None) -> Any:
     """A lightweight stand-in for ProxLbData.Meta.Balancing."""
     return SimpleNamespace(
         target_storage_auto=target_storage_auto,
@@ -38,19 +39,20 @@ def _balancing(capacity_guard=True, min_free_percent=10.0, min_free_gib=0,
     )
 
 
-def _data(balancing):
+def _data(balancing: Any) -> Any:
     data = MagicMock()
     data.meta.balancing = balancing
     return data
 
 
-def _api(storages):
+def _api(storages: list[dict[str, Any]]) -> Any:
     api = MagicMock()
     api.nodes.return_value.storage.get.return_value = storages
     return api
 
 
-def _storage(name, total_gib, avail_gib, content="images", active=1, enabled=1):
+def _storage(name: str, total_gib: int, avail_gib: int, content: str = "images", active: int = 1,
+             enabled: int = 1) -> dict[str, Any]:
     return {
         "storage": name,
         "active": active,
@@ -63,7 +65,7 @@ def _storage(name, total_gib, avail_gib, content="images", active=1, enabled=1):
 
 # --- _storage_fits ----------------------------------------------------------
 
-def test_storage_fits_true_when_room_and_margin_ok():
+def test_storage_fits_true_when_room_and_margin_ok() -> None:
     """A guest fits when free space minus its disk still clears the margin."""
     balancing = _balancing(min_free_percent=10.0)  # margin = 100 GiB on 1000 total
     storage = _storage("big", total_gib=1000, avail_gib=500)
@@ -71,7 +73,7 @@ def test_storage_fits_true_when_room_and_margin_ok():
     assert Balancing._storage_fits(storage, 300 * GIB, 0, balancing) is True
 
 
-def test_storage_fits_false_when_margin_violated():
+def test_storage_fits_false_when_margin_violated() -> None:
     """A guest is rejected when consuming it would eat into the safety margin."""
     balancing = _balancing(min_free_percent=10.0)  # margin = 100 GiB
     storage = _storage("tight", total_gib=1000, avail_gib=350)
@@ -79,7 +81,7 @@ def test_storage_fits_false_when_margin_violated():
     assert Balancing._storage_fits(storage, 300 * GIB, 0, balancing) is False
 
 
-def test_storage_fits_accounts_for_reservations():
+def test_storage_fits_accounts_for_reservations() -> None:
     """In-flight reservations reduce the effective free space."""
     balancing = _balancing(min_free_percent=0.0)
     storage = _storage("s", total_gib=1000, avail_gib=500)
@@ -89,7 +91,7 @@ def test_storage_fits_accounts_for_reservations():
     assert Balancing._storage_fits(storage, 300 * GIB, 0, balancing) is True
 
 
-def test_storage_fits_absolute_floor_margin():
+def test_storage_fits_absolute_floor_margin() -> None:
     """The GiB floor wins when it is larger than the percentage margin."""
     balancing = _balancing(min_free_percent=1.0, min_free_gib=200)  # floor 200 > 10 GiB pct
     storage = _storage("s", total_gib=1000, avail_gib=400)
@@ -99,7 +101,7 @@ def test_storage_fits_absolute_floor_margin():
 
 # --- _resolve_target_storage with guard ------------------------------------
 
-def test_guard_skips_too_small_storage_and_picks_fitting_one():
+def test_guard_skips_too_small_storage_and_picks_fitting_one() -> None:
     """Among candidates, only those passing the guard are eligible."""
     storages = [
         _storage("toosmall", total_gib=500, avail_gib=120),   # 120-300<0 -> out
@@ -111,7 +113,7 @@ def test_guard_skips_too_small_storage_and_picks_fitting_one():
     assert result == "ok"
 
 
-def test_guard_raises_when_nothing_fits():
+def test_guard_raises_when_nothing_fits() -> None:
     """If no candidate can hold the guest plus margin, an error is raised."""
     storages = [
         _storage("a", total_gib=500, avail_gib=200),
@@ -123,7 +125,7 @@ def test_guard_raises_when_nothing_fits():
         Balancing._resolve_target_storage(api, data, "pve5", "images", 400 * GIB)
 
 
-def test_guard_picks_storage_with_most_effective_headroom():
+def test_guard_picks_storage_with_most_effective_headroom() -> None:
     """Selection prefers the most free space after subtracting reservations."""
     storages = [
         _storage("a", total_gib=2000, avail_gib=900),
@@ -137,7 +139,7 @@ def test_guard_picks_storage_with_most_effective_headroom():
     assert result == "a"
 
 
-def test_guard_disabled_keeps_legacy_most_free_behaviour():
+def test_guard_disabled_keeps_legacy_most_free_behaviour() -> None:
     """With the guard off, the largest-avail storage is chosen regardless of size."""
     storages = [
         _storage("small", total_gib=100, avail_gib=10),
@@ -150,7 +152,7 @@ def test_guard_disabled_keeps_legacy_most_free_behaviour():
     assert result == "big"
 
 
-def test_required_zero_skips_guard():
+def test_required_zero_skips_guard() -> None:
     """When the disk size is unknown (0), the guard is bypassed."""
     storages = [_storage("only", total_gib=100, avail_gib=1)]
     api = _api(storages)
@@ -159,7 +161,7 @@ def test_required_zero_skips_guard():
     assert result == "only"
 
 
-def test_mapped_storage_capacity_checked():
+def test_mapped_storage_capacity_checked() -> None:
     """An explicit mapping is still capacity-checked when the guard is active."""
     storages = [_storage("local", total_gib=500, avail_gib=100)]
     api = _api(storages)
@@ -168,7 +170,7 @@ def test_mapped_storage_capacity_checked():
         Balancing._resolve_target_storage(api, data, "pve5", "images", 200 * GIB)
 
 
-def test_mapped_storage_trusted_when_unlistable():
+def test_mapped_storage_trusted_when_unlistable() -> None:
     """If the mapped storage can't be verified, the explicit mapping is trusted."""
     storages = [_storage("other", total_gib=500, avail_gib=400)]
     api = _api(storages)
@@ -179,7 +181,7 @@ def test_mapped_storage_trusted_when_unlistable():
 
 # --- reserve / release lifecycle -------------------------------------------
 
-def test_reserve_and_reserved_bytes_roundtrip():
+def test_reserve_and_reserved_bytes_roundtrip() -> None:
     """Reserving records bytes that _reserved_bytes then sums per storage."""
     data = _data(_balancing())
     Balancing._reserve_target_storage(data, "vm1", "pve5", "local", 100 * GIB)
@@ -190,7 +192,7 @@ def test_reserve_and_reserved_bytes_roundtrip():
     assert Balancing._reserved_bytes(data, "pve2", "local") == 0
 
 
-def test_release_frees_reservation():
+def test_release_frees_reservation() -> None:
     """Releasing removes a guest's reservation from the running total."""
     data = _data(_balancing())
     Balancing._reserve_target_storage(data, "vm1", "pve5", "local", 100 * GIB)
@@ -200,7 +202,7 @@ def test_release_frees_reservation():
     Balancing._release_target_storage(data, "ghost")
 
 
-def test_concurrent_reservations_block_overcommit():
+def test_concurrent_reservations_block_overcommit() -> None:
     """Two guests targeting the same storage can't both be placed if only one fits."""
     storages = [_storage("shared", total_gib=1000, avail_gib=600)]
     api = _api(storages)

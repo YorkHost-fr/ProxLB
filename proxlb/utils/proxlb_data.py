@@ -1,4 +1,4 @@
-from typing import Any, Literal, Optional, TypeVar, assert_never
+from typing import Any, Literal, Optional, TypeVar
 from pydantic import BaseModel
 from proxlb.utils.config_parser import Config
 
@@ -106,6 +106,8 @@ class ProxLbData(BaseModel):
         # Storage selected for this guest by the storage balancer when it is
         # migrated to another node (overrides target_storage_auto/map).
         target_storage: Optional[str] = None
+        # Why a migration was planned: balancing | maintenance | drain | storage
+        move_reason: str = ""
 
         def metric(self, name: BalancingResource) -> Metric:
             name = Config.Balancing.base_resource(name)
@@ -115,7 +117,7 @@ class ProxLbData(BaseModel):
                 return self.disk
             if name == BalancingResource.Memory:
                 return self.memory
-            assert_never(name)
+            raise ValueError(f"unexpected base resource: {name}")
 
     class Node(BaseModel):
         class Metric(BaseModel):
@@ -138,6 +140,12 @@ class ProxLbData(BaseModel):
         cpu: Metric
         disk: Metric
         memory: Metric
+        drain: bool = False              # decommission.nodes: being emptied
+        no_target: bool = False          # proxmox_cluster.no_target_nodes
+
+        def accepts_guests(self) -> bool:
+            """May this node receive a guest?"""
+            return not (self.maintenance or self.drain or self.no_target)
 
         def metric(self, name: BalancingResource) -> Metric:
             name = Config.Balancing.base_resource(name)
@@ -147,7 +155,7 @@ class ProxLbData(BaseModel):
                 return self.disk
             if name == BalancingResource.Memory:
                 return self.memory
-            assert_never(name)
+            raise ValueError(f"unexpected base resource: {name}")
 
     class Storage(BaseModel):
         key: str                         # '<node>::<id>' or 'shared::<id>'
@@ -171,9 +179,16 @@ class ProxLbData(BaseModel):
         # I/O errors even though the data area still has free space.
         metadata_used_percent: Optional[float] = None
         limit: str = "data"              # what drives the status: data | metadata
+        # '' | excluded | no_target | drain (exceptions / decommissioning)
+        role: str = ""
+        # Decommissioning progress: volumes and bytes still on the storage,
+        # and the volumes that cannot be moved automatically (with why).
+        drain_volumes: int = 0
+        drain_bytes: int = 0
+        drain_blocked: list[str] = []
 
     class StorageAction(BaseModel):
-        action: Literal["fstrim", "move_disk", "migrate"]
+        action: Literal["fstrim", "move_disk", "move_volume", "migrate"]
         guest: str
         guest_id: int
         guest_type: GuestType
