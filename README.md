@@ -355,6 +355,8 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | psi |  | { nodes: { memory: { pressure_full: 0.20, pressure_some: 0.20, pressure_spikes: 1.00 }}} | `Dict` | A dict of PSI based thresholds for nodes and guests |
 |  | pools |  | pools: { dev: { type: affinity }, de-nbg01-db: { type: anti-affinity }} | `Dict` | A dict of pool names and their type for creating affinity/anti-affinity rules |
 | *Environment* | `PROXLB_ENV_FILE` |  | /secrets/.env | `Str` | Optional dotenv file read for the `PROXLB_*` variables below (real environment variables win). |
+|  | `PROXLB_CPU_VENDOR` |  |  | `Str` | Sets `proxmox_cluster.cpu_vendor` (instance identity set by the deployment). |
+|  | `PROXLB_IGNORE_NODES` / `PROXLB_NO_TARGET_NODES` / `PROXLB_NO_TARGET_STORAGES` |  |  | `Str` | Comma separated entries added to the matching lists of the configuration file. |
 |  | `PROXLB_API_HOSTS` / `PROXLB_API_USER` / `PROXLB_API_PASS` / `PROXLB_API_TOKEN_ID` / `PROXLB_API_TOKEN_SECRET` |  |  | `Str` | Override the `proxmox_api` hosts (comma separated) and credentials, so secrets stay out of the config file. |
 |  | `PROXLB_CONTROL_TOKEN` |  |  | `Str` | Bearer token of the control endpoint. |
 | `storage_balancing` |  |  |  |  |  |

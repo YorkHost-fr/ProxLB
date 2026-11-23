@@ -514,6 +514,13 @@ class ConfigParser:
         "PROXLB_API_TOKEN_SECRET": "token_secret",
     }
 
+    # Comma separated entries added to a list of the configuration file.
+    ENV_LIST_ADDITIONS = {
+        "PROXLB_IGNORE_NODES": ("proxmox_cluster", "ignore_nodes"),
+        "PROXLB_NO_TARGET_NODES": ("proxmox_cluster", "no_target_nodes"),
+        "PROXLB_NO_TARGET_STORAGES": ("storage_balancing", "no_target_storages"),
+    }
+
     @staticmethod
     def read_env_file(path: str) -> dict[str, str]:
         """
@@ -576,6 +583,23 @@ class ConfigParser:
             logger.debug(f"proxmox_api.{key} set from environment variable {variable}.")
         if api:
             data["proxmox_api"] = api
+        # Instance identity set by the deployment (e.g. Kubernetes): CPU vendor
+        # and list entries added to the configuration file's lists.
+        vendor = env.get("PROXLB_CPU_VENDOR", "").strip().lower()
+        if vendor:
+            cluster = dict(data.get("proxmox_cluster") or {})
+            cluster["cpu_vendor"] = vendor
+            data["proxmox_cluster"] = cluster
+            logger.debug("proxmox_cluster.cpu_vendor set from environment variable PROXLB_CPU_VENDOR.")
+        for variable, (section, key) in ConfigParser.ENV_LIST_ADDITIONS.items():
+            items = [v.strip() for v in env.get(variable, "").split(",") if v.strip()]
+            if not items:
+                continue
+            part = dict(data.get(section) or {})
+            current = list(part.get(key) or [])
+            part[key] = current + [v for v in items if v not in current]
+            data[section] = part
+            logger.debug(f"{section}.{key}: {', '.join(items)} added from environment variable {variable}.")
         return data
 
     @staticmethod
