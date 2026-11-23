@@ -123,6 +123,7 @@ class Nodes:
         if cluster.cpu_vendor is None:
             return True
         return Nodes.cpu_vendor_of(Nodes.cpu_models.get(node_name, "")) == str(cluster.cpu_vendor)
+
     def __init__(self) -> None:
         """
         Initializes the Nodes class with the provided ProxLB data.
