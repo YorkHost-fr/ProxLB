@@ -72,9 +72,20 @@ class Config(BaseModel):
             pre_migration: int = Field(default=0, alias="pre-migration", ge=0)
             schedules: dict[str, list[str]] = Field(default_factory=dict)
 
+        class CpuVendor(StrEnum):
+            Intel = "intel"
+            Amd = "amd"
+
         _maintenance_nodes_static: list[str] = PrivateAttr(default_factory=list)
+        # Online nodes of another CPU vendor (cpu_vendor), found at run time.
+        _auto_ignored: set[str] = PrivateAttr(default_factory=set)
 
         ignore_nodes: list[str] = []
+        # Only manage the nodes whose CPU is of this vendor (read from the
+        # Proxmox API): a new node is picked up by the right instance without
+        # editing ignore_nodes (live migration between Intel and AMD fails).
+        # Nodes with an unknown CPU are ignored. None = every node.
+        cpu_vendor: Optional[CpuVendor] = None
         maintenance_nodes: list[str] = []
         # Exception: these nodes never receive guests (balancing, storage
         # relief, decommissioning), their own guests are still balanced away.
@@ -87,6 +98,13 @@ class Config(BaseModel):
 
         def static_maintenance_nodes(self) -> list[str]:
             return list(self._maintenance_nodes_static)
+
+        def ignored_nodes(self) -> set[str]:
+            """ignore_nodes plus the nodes of another CPU vendor."""
+            return set(self.ignore_nodes) | self._auto_ignored
+
+        def set_auto_ignored(self, nodes: set[str]) -> None:
+            self._auto_ignored = set(nodes)
 
     class Balancing(BaseModel):
         class Resource(StrEnum):

@@ -16,6 +16,9 @@ proxmox_cluster:
   maintenance_nodes: ['virt66.example.com']
   # Exception: nodes that never receive guests (still balanced away from).
   no_target_nodes: []
+  # Only manage the nodes of this CPU vendor ('intel' or 'amd'), read from
+  # the Proxmox API: new nodes are picked up automatically. Unset = all nodes.
+  # cpu_vendor: intel
   maintenance_nodes_schedule:
     duration: 3                       # Duration in hours after the configured schedule start
     pre-migration: 10                 # Start maintenance this many minutes before the configured schedule

@@ -1,3 +1,4 @@
 added:
   - Exceptions - proxmox_cluster.no_target_nodes and storage_balancing.no_target_storages (never a destination), storage patterns '<node>::<storage>'.
   - Progressive decommissioning of nodes and storages (decommission section), including stopped guests and unused VM disks, with status on the control endpoint.
+  - proxmox_cluster.cpu_vendor - manage only the nodes of one CPU vendor, detected from the Proxmox API (new nodes picked up automatically, reported on the control endpoint).

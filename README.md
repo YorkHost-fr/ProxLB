@@ -377,6 +377,7 @@ The following options can be set in the configuration file `proxlb.yaml`:
 |  | max_move_time |  | 7200 | `Int` | Seconds after which a disk move is reported as timed out. |
 |  | bwlimit |  |  | `Int` | Optional bandwidth limit for disk moves in KiB/s. |
 |  | exclude_storages |  | [] | `List` | Storages never touched by the storage balancer: `<storage>` (every node), `<node>::<storage>` or `shared::<storage>`. |
+| `proxmox_cluster` | cpu_vendor |  | None | `Str` | `intel` or `amd`: only manage the nodes whose CPU (Proxmox API) is of this vendor. New nodes are picked up automatically, nodes with an unknown CPU are ignored. Run one instance per vendor (live migration between Intel and AMD fails). |
 |  | no_target_storages |  | [] | `List` | Exception: storages monitored and relieved but never a destination of a disk move / migration (same patterns). |
 | `decommission` | nodes |  | [] | `List` | Nodes to empty progressively: never a target, guests migrated away (RAM ceiling, inflow and storage checks apply). |
 |  | storages |  | [] | `List` | Storages to empty progressively: disks moved to another storage of the node, or the guest migrated with its disks. |

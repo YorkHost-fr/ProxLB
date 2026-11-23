@@ -17,6 +17,7 @@ import logging
 import signal
 import sys
 import time
+from typing import Any
 
 import proxmoxer
 import proxmoxer.backends.https
@@ -114,6 +115,9 @@ def publish_config() -> None:
     )
 
 
+cluster_info: dict[str, Any] = {}
+
+
 def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> None:
     """
     Publish the outcome of a balancing run on the control endpoint.
@@ -158,6 +162,7 @@ def publish_status(proxlb_data: ProxLbData, started: float, error: str = "") -> 
             } for s in storages if s.role == "drain"],
             "max_actions_per_run": proxlb_config.decommission.max_actions_per_run,
         },
+        cluster=cluster_info,
         exceptions={
             "no_target_nodes": proxlb_config.proxmox_cluster.no_target_nodes,
             "no_target_storages": proxlb_config.storage_balancing.no_target_storages,
@@ -172,9 +177,10 @@ if proxlb_config.service.control.enable and not cli_args.storage_report:
 
 # Fast storage report: storages only, no guest metrics, then exit.
 if cli_args.storage_report:
+    Nodes.detect_cpu_vendors(proxmox_api, proxlb_config)
     _report_nodes = [
         n["node"] for n in proxmox_api.nodes.get()
-        if n.get("status") == "online" and n["node"] not in proxlb_config.proxmox_cluster.ignore_nodes
+        if n.get("status") == "online" and n["node"] not in proxlb_config.proxmox_cluster.ignored_nodes()
     ]
     _report_storages = Storages.get_storages(
         proxmox_api, _report_nodes, proxlb_config.storage_balancing,
@@ -248,6 +254,7 @@ while True:
 
         # Get all required objects from the Proxmox cluster
         Helper.apply_maintenance_nodes_schedule(proxlb_config)
+        cluster_info = Nodes.detect_cpu_vendors(proxmox_api, proxlb_config)
         nodes = Nodes.get_nodes(proxmox_api, proxlb_config)
         meta = Features.validate_any_non_pve9_node(proxlb_config, nodes)
         pools = Pools.get_pools(proxmox_api)
