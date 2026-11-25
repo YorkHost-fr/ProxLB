@@ -246,3 +246,40 @@ def test_move_volume_uses_the_lxc_endpoint() -> None:
     api.nodes.return_value.lxc.return_value.move_volume.post.assert_called_once_with(
         volume="rootfs", storage="new", delete=1)
     api.nodes.return_value.qemu.assert_not_called()
+
+
+def test_plan_drain_skips_leftover_copy_of_a_migrated_guest() -> None:
+    # 'hot::old' is local to 'hot'; VM 200 now runs on cool1 and its config
+    # still names "old:vm-200-disk-0" (same storage name on cool1): the copy
+    # on 'hot' is a leftover, moving it would target the live disk.
+    data = _drain_data()
+    data.guests["web"].node_current = data.guests["web"].node_target = "cool1"
+    rows = [{"volid": "old:vm-200-disk-0", "vmid": 200, "content": "images", "size": 10 * GIB}]
+    resources = [{"vmid": 200, "node": "cool1", "type": "qemu", "status": "running", "name": "web"}]
+    configs = {200: {"efidisk0": "old:vm-200-disk-0,size=1M"}}
+    actions = StorageBalancing.plan_drain(_drain_api(rows, resources, configs), data)
+    assert actions == []
+    assert any("leftover copy" in b and "cool1" in b for b in data.storages["hot::old"].drain_blocked)
+
+
+def test_plan_drain_does_not_retry_a_failed_move_for_24h() -> None:
+    from proxlb.models import storage_balancing as sb
+    data = _drain_data()
+    rows = [{"volid": "old:vm-200-disk-0", "vmid": 200, "content": "images", "size": 10 * GIB}]
+    resources = [{"vmid": 200, "node": "hot", "type": "qemu", "status": "running"}]  # no name in resources
+    configs = {200: {"tpmstate0": "old:vm-200-disk-0,size=4M"}}
+    first = StorageBalancing.plan_drain(_drain_api(rows, resources, configs), data)
+    assert [(a.guest, a.volume) for a in first] == [("web", "tpmstate0")]  # ProxLB's name, not the id
+    sb.record_failed_move(first[0])
+
+    data = _drain_data()
+    again = StorageBalancing.plan_drain(_drain_api(rows, resources, configs), data)
+    assert again == []
+    assert any("last move failed" in b for b in data.storages["hot::old"].drain_blocked)
+
+    # After the cooldown the move is planned again.
+    import time
+    key = sb._move_key(200, "tpmstate0", "hot::old")
+    sb._failed_moves[key] = time.time() - sb.FAILED_MOVE_COOLDOWN - 1
+    data = _drain_data()
+    assert len(StorageBalancing.plan_drain(_drain_api(rows, resources, configs), data)) == 1

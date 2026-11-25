@@ -42,6 +42,32 @@ NO_TRIM_TYPES = {"lvm", "iscsi", "iscsidirect"}
 # Guest config keys holding a disk / volume (VM disks, CT rootfs and mount points).
 _DISK_KEY = re.compile(r"^(scsi|sata|ide|virtio|efidisk|tpmstate)\d+$|^rootfs$|^mp\d+$")
 
+# A disk move that failed is not retried before this delay: otherwise the
+# same failing move (and its "failed" event) comes back at every run.
+FAILED_MOVE_COOLDOWN = 24 * 3600
+# guest id:volume key:source storage -> time.time() of the last failure.
+# Kept in memory: the daemon runs in a single long-lived process.
+_failed_moves: dict[str, float] = {}
+
+
+def _move_key(guest_id: int, volume: str, source_storage: str) -> str:
+    return f"{guest_id}:{volume}:{source_storage}"
+
+
+def failed_recently(guest_id: int, volume: str, source_storage: str, now: Optional[float] = None) -> Optional[float]:
+    """Time of the last failure of this move if it is still in its cooldown."""
+    at = _failed_moves.get(_move_key(guest_id, volume, source_storage))
+    if at is None:
+        return None
+    if (now if now is not None else time.time()) - at >= FAILED_MOVE_COOLDOWN:
+        return None
+    return at
+
+
+def record_failed_move(action: ProxLbData.StorageAction, now: Optional[float] = None) -> None:
+    _failed_moves[_move_key(action.guest_id, action.volume, action.source_storage)] = \
+        now if now is not None else time.time()
+
 
 class StorageBalancing:
     """
@@ -319,6 +345,10 @@ class StorageBalancing:
         config = StorageBalancing._config(proxlb_data)
         if guest.type != GuestType.Vm:
             return None
+        if failed_recently(guest.id, volume.key, source.key):
+            logger.info(f"Storage: not retrying the move of {guest.name} {volume.key} from {source.key} "
+                        "(failed less than 24 h ago).")
+            return None
 
         node = guest.node_current
         target = StorageBalancing._destination(proxlb_data, node, "images", source, volume.size)
@@ -558,8 +588,23 @@ class StorageBalancing:
                 if key is None:
                     block(volid, "not referenced in the guest config")
                     continue
-                name = str(res.get("name") or vmid)
                 node = str(res["node"])
+                if not storage.shared and node != storage.node:
+                    # Local storage of another node: a copy left behind by an
+                    # old migration, with the same volid as the live disk.
+                    # Moving it would act on the live disk (same storage name).
+                    block(volid, f"leftover copy: the guest now runs on {node} (old migration?), "
+                                 "check it then remove it by hand")
+                    continue
+                failed_at = failed_recently(vmid, key, storage.key)
+                if failed_at is not None:
+                    block(volid, "last move failed at "
+                                 f"{time.strftime('%d/%m %H:%M', time.localtime(failed_at))}, retried 24 h later "
+                                 "(see the Proxmox task log)")
+                    continue
+                # Stable label in events: the name ProxLB knows, then the
+                # cluster resource name, then the id.
+                name = guest.name if guest is not None else str(res.get("name") or vmid)
                 is_vm = res.get("type") == "qemu"
 
                 action: Optional[ProxLbData.StorageAction] = None
@@ -629,6 +674,7 @@ class StorageBalancing:
                 queue.remove(action)
                 upid = StorageBalancing._start_move(proxmox_api, action, config)
                 if upid is None:
+                    record_failed_move(action)
                     ok = False
                     continue
                 running.append((action, upid, time.monotonic()))
@@ -649,6 +695,7 @@ class StorageBalancing:
                     logger.info(f"Storage: moved {action.guest} {action.volume} to {action.target_storage}.")
                 else:
                     action.status = "failed"
+                    record_failed_move(action)
                     ok = False
                     reason = "timed out" if state == "running" else "failed"
                     logger.critical(f"Storage: disk move of {action.guest} {action.volume} to "

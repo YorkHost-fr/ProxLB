@@ -359,3 +359,19 @@ def test_forecast_ignores_mostly_empty_storage() -> None:
     # Floor configurable.
     cfg = Config.StorageBalancing(forecast_min_percent=0)
     assert _storage("pve8::ssd-thin", 1740, 484, growth_gib_day=284, cfg=cfg).status == "forecast"
+
+
+def test_failed_disk_move_is_not_replanned() -> None:
+    full = _storage("pve1::local-lvm", 100, 95)
+    other = _storage("pve1::data", 1000, 0)
+    data = _data([full, other], [_vm("vm1", "pve1", [("scsi0", "local-lvm", 40)])])
+    StorageBalancing.plan(data)
+    api = MagicMock()
+    api.nodes.return_value.qemu.return_value.move_disk.post.return_value = "UPID:x"
+    api.nodes.return_value.tasks.return_value.status.get.return_value = {"status": "stopped", "exitstatus": "error"}
+    assert StorageBalancing.execute_disk_moves(api, data, poll_interval=0) is False
+    # Next run: same storages, same VM, the failed move is not planned again.
+    full = _storage("pve1::local-lvm", 100, 95)
+    other = _storage("pve1::data", 1000, 0)
+    data = _data([full, other], [_vm("vm1", "pve1", [("scsi0", "local-lvm", 40)])])
+    assert [a for a in StorageBalancing.plan(data) if a.action == "move_disk"] == []
